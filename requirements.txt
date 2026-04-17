@@ -1,0 +1,16 @@
+# Floating Lyrics — Python dependencies
+#
+# Install with:  pnpm dlx -- pipx run pip install -r requirements.txt
+# or simply:     pip install -r requirements.txt
+#
+# Requires Python 3.10+
+
+# UI framework
+PyQt6>=6.4.0
+
+# WASAPI loopback audio capture (Windows-only fork of PyAudio)
+# Docs: https://github.com/s0d3s/PyAudioWPatch
+pyaudiowpatch>=0.2.12.6
+
+# HTTP client for AudD, lrclib.net, Musixmatch
+requests>=2.31.0
