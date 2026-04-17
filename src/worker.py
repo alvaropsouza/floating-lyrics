@@ -62,6 +62,7 @@ class RecognitionWorker(QThread):
         self._sync_timecode_ms: int = 0
         self._sync_capture_start: float = 0.0
         self._sync_rate: float = 1.0
+        self._sync_bias_ms: float = 0.0
         self._confident_streak: int = 0
         self._drift_samples: int = 0
         self._raw_abs_ema: float = 0.0
@@ -95,6 +96,8 @@ class RecognitionWorker(QThread):
         )
         self._alpha = self._config.getfloat("Recognition", "timecode_alpha", fallback=0.18)
         self._beta = self._config.getfloat("Recognition", "timecode_beta", fallback=0.04)
+        self._bias_gamma = self._config.getfloat("Recognition", "timecode_bias_gamma", fallback=0.02)
+        self._bias_max_ms = self._config.getint("Recognition", "timecode_bias_max_ms", fallback=1200)
         self._max_jump_ms = self._config.getint("Recognition", "timecode_max_jump_ms", fallback=7000)
         self._log_every_n = max(
             1,
@@ -259,6 +262,7 @@ class RecognitionWorker(QThread):
             self._sync_timecode_ms = raw
             self._sync_capture_start = capture_start
             self._sync_rate = 1.0
+            self._sync_bias_ms = 0.0
             self._confident_streak = 1 if conf_pct >= self._min_confidence_pct else 0
             self._drift_samples = 0
             self._raw_abs_ema = 0.0
@@ -274,7 +278,7 @@ class RecognitionWorker(QThread):
 
         elapsed_ms = int(max(0.0, capture_start - self._sync_capture_start) * 1000)
         elapsed_ms = max(1, elapsed_ms)
-        expected_ms = int(self._sync_timecode_ms + elapsed_ms * self._sync_rate)
+        expected_ms = int(self._sync_timecode_ms + elapsed_ms * self._sync_rate + self._sync_bias_ms)
         raw_delta = raw - expected_ms
 
         if conf_pct >= self._min_confidence_pct:
@@ -292,10 +296,14 @@ class RecognitionWorker(QThread):
             conf_gain = 0.6 + 0.4 * (conf_pct / 100.0)
             alpha = max(0.0, min(1.0, self._alpha * conf_gain))
             beta = max(0.0, min(0.3, self._beta * conf_gain))
+            gamma = max(0.0, min(0.2, self._bias_gamma * conf_gain))
 
             stabilized = int(expected_ms + alpha * innovation)
             self._sync_rate += beta * (innovation / elapsed_ms)
             self._sync_rate = max(0.97, min(1.03, self._sync_rate))
+            # Slow bias correction for persistent lead/lag errors.
+            self._sync_bias_ms += gamma * innovation
+            self._sync_bias_ms = max(-self._bias_max_ms, min(self._bias_max_ms, self._sync_bias_ms))
 
         stable_delta = stabilized - expected_ms
 
@@ -319,7 +327,7 @@ class RecognitionWorker(QThread):
             improvement = self._raw_abs_ema - self._stable_abs_ema
             _LOG.info(
                 "SYNC drift | song='%s - %s' conf=%.1f%% streak=%d raw_delta=%+dms stable_delta=%+dms "
-                "raw_ema=%.1fms stable_ema=%.1fms gain=%.1fms rate=%.5f",
+                "raw_ema=%.1fms stable_ema=%.1fms gain=%.1fms rate=%.5f bias=%.1fms",
                 title,
                 artist,
                 conf_pct,
@@ -330,6 +338,7 @@ class RecognitionWorker(QThread):
                 self._stable_abs_ema,
                 improvement,
                 self._sync_rate,
+                self._sync_bias_ms,
             )
         return stabilized
 

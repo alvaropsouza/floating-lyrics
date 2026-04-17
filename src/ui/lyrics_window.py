@@ -136,6 +136,7 @@ class LyricsWindow(QWidget):
         self._font_size:     int = 16
         self._font_color:    str = "#FFFFFF"
         self._lrc_offset_ms: int = 0
+        self._line_hysteresis_ms: int = 70
 
         # ── UI helpers ────────────────────────────────────────────────────────
         self._drag_pos: Optional[QPoint] = None
@@ -265,6 +266,10 @@ class LyricsWindow(QWidget):
         self._font_size     = self._config.getint("Display", "font_size",     fallback=16)
         self._font_color    = self._config.get("Display",    "font_color",    fallback="#FFFFFF")
         self._lrc_offset_ms = self._config.getint("Display", "lrc_offset_ms", fallback=0)
+        self._line_hysteresis_ms = max(
+            0,
+            self._config.getint("Display", "line_switch_hysteresis_ms", fallback=70),
+        )
 
     def _set_always_on_top(self, enabled: bool) -> None:
         flags = self.windowFlags()
@@ -497,11 +502,30 @@ class LyricsWindow(QWidget):
         """Advance the highlighted line; called by the single-shot timer."""
         if not self._is_synced or not self._lrc_lines:
             return
-        new_idx = find_current_line(self._lrc_lines, self._elapsed_ms())
+        elapsed = self._elapsed_ms()
+        new_idx = find_current_line(self._lrc_lines, elapsed)
+        new_idx = self._apply_line_hysteresis(new_idx, elapsed)
         if new_idx != self._current_idx:
             self._current_idx = new_idx
             self._update_line_styles(new_idx)
         self._schedule_next_tick()
+
+    def _apply_line_hysteresis(self, candidate_idx: int, elapsed_ms: int) -> int:
+        """Delay forward line switches by a small hysteresis window."""
+        if not self._lrc_lines or self._line_hysteresis_ms <= 0:
+            return candidate_idx
+        if self._current_idx < 0:
+            return candidate_idx
+        # Allow backward corrections immediately; delay only forward hops.
+        if candidate_idx <= self._current_idx:
+            return candidate_idx
+        if candidate_idx >= len(self._lrc_lines):
+            return len(self._lrc_lines) - 1
+
+        threshold_ms = self._lrc_lines[candidate_idx].time_ms + self._line_hysteresis_ms
+        if elapsed_ms < threshold_ms:
+            return self._current_idx
+        return candidate_idx
 
     def _schedule_next_tick(self) -> None:
         """Schedule the timer to fire exactly when the next LRC line is due."""
@@ -509,10 +533,11 @@ class LyricsWindow(QWidget):
         if not self._is_synced or not self._lrc_lines:
             return
         elapsed  = self._elapsed_ms()
-        next_idx = find_current_line(self._lrc_lines, elapsed) + 1
+        next_idx = self._current_idx + 1 if self._current_idx >= 0 else 0
         if next_idx >= len(self._lrc_lines):
             return
-        delay = max(5, self._lrc_lines[next_idx].time_ms - elapsed - 20)
+        target_ms = self._lrc_lines[next_idx].time_ms + self._line_hysteresis_ms
+        delay = max(5, target_ms - elapsed - 20)
         self._sync_timer.start(delay)
 
     # ── Mouse events (title-bar drag) ─────────────────────────────────────────

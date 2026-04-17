@@ -33,6 +33,8 @@ _DEFAULTS: dict[str, dict[str, str]] = {
         "timecode_confident_streak": "2",
         "timecode_alpha": "0.18",
         "timecode_beta": "0.04",
+        "timecode_bias_gamma": "0.02",
+        "timecode_bias_max_ms": "1200",
         "timecode_max_jump_ms": "7000",
         "timecode_log_every_n": "5",
     },
@@ -48,6 +50,7 @@ _DEFAULTS: dict[str, dict[str, str]] = {
         "window_height": "160",
         "lines_context": "2",
         "lrc_offset_ms": "0",
+        "line_switch_hysteresis_ms": "70",
     },
     "Preferences": {
         "start_minimized": "false",
