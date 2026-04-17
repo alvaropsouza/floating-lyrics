@@ -7,6 +7,7 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QFormLayout,
     QGroupBox,
@@ -106,11 +107,20 @@ class SettingsDialog(QDialog):
         layout.addStretch()
 
     def _build_api_group(self) -> QGroupBox:
-        grp = QGroupBox("Chaves de API")
+        grp = QGroupBox("Reconhecimento de música")
         fl  = QFormLayout(grp)
 
+        # Provider selector
+        self._combo_provider = QComboBox()
+        self._combo_provider.addItem("AudD", "audd")
+        self._combo_provider.addItem("ACRCloud", "acrcloud")
+        current_provider = self._config.get("Recognition", "recognition_provider", fallback="audd").strip().lower()
+        self._combo_provider.setCurrentIndex(0 if current_provider != "acrcloud" else 1)
+        fl.addRow("Provedor:", self._combo_provider)
+
+        # ── AudD fields ──────────────────────────────────────────────────────
         self._edit_audd = QLineEdit()
-        self._edit_audd.setPlaceholderText("Chave AudD (vazio = modo de teste, ~10 req/dia)")
+        self._edit_audd.setPlaceholderText("Chave AudD (vazio = modo teste, ~10 req/dia)")
         self._edit_audd.setEchoMode(QLineEdit.EchoMode.Password)
         self._edit_audd.setText(self._config.get("API", "audd_api_key", fallback=""))
 
@@ -120,6 +130,44 @@ class SettingsDialog(QDialog):
         )
         lnk_audd.setOpenExternalLinks(True)
 
+        self._row_audd_key  = (QLabel("AudD API Key:"), self._edit_audd)
+        self._row_audd_link = (QLabel(""), lnk_audd)
+        fl.addRow(*self._row_audd_key)
+        fl.addRow(*self._row_audd_link)
+
+        # ── ACRCloud fields ──────────────────────────────────────────────────
+        self._edit_acr_key = QLineEdit()
+        self._edit_acr_key.setPlaceholderText("Access Key")
+        self._edit_acr_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._edit_acr_key.setText(self._config.get("ACRCloud", "access_key", fallback=""))
+
+        self._edit_acr_secret = QLineEdit()
+        self._edit_acr_secret.setPlaceholderText("Access Secret")
+        self._edit_acr_secret.setEchoMode(QLineEdit.EchoMode.Password)
+        self._edit_acr_secret.setText(self._config.get("ACRCloud", "access_secret", fallback=""))
+
+        self._edit_acr_host = QLineEdit()
+        self._edit_acr_host.setPlaceholderText("identify-eu-west-1.acrcloud.com")
+        self._edit_acr_host.setText(
+            self._config.get("ACRCloud", "host", fallback="identify-eu-west-1.acrcloud.com")
+        )
+
+        lnk_acr = QLabel(
+            '<a href="https://console.acrcloud.com/" style="color:#8899FF;">'
+            "Criar projeto gratuito ACRCloud →</a>"
+        )
+        lnk_acr.setOpenExternalLinks(True)
+
+        self._row_acr_key    = (QLabel("Access Key:"),    self._edit_acr_key)
+        self._row_acr_secret = (QLabel("Access Secret:"), self._edit_acr_secret)
+        self._row_acr_host   = (QLabel("Host:"),          self._edit_acr_host)
+        self._row_acr_link   = (QLabel(""),               lnk_acr)
+        fl.addRow(*self._row_acr_key)
+        fl.addRow(*self._row_acr_secret)
+        fl.addRow(*self._row_acr_host)
+        fl.addRow(*self._row_acr_link)
+
+        # ── Musixmatch ───────────────────────────────────────────────────────
         self._edit_mx = QLineEdit()
         self._edit_mx.setPlaceholderText("Musixmatch (opcional — fallback de letras simples)")
         self._edit_mx.setEchoMode(QLineEdit.EchoMode.Password)
@@ -131,14 +179,23 @@ class SettingsDialog(QDialog):
         )
         lnk_mx.setOpenExternalLinks(True)
 
-        self._btn_save_api = QPushButton("Salvar chaves de API")
-
-        fl.addRow("AudD API Key:",   self._edit_audd)
-        fl.addRow("",                lnk_audd)
         fl.addRow("Musixmatch Key:", self._edit_mx)
         fl.addRow("",                lnk_mx)
-        fl.addRow("",                self._btn_save_api)
+
+        self._btn_save_api = QPushButton("Salvar configurações de API")
+        fl.addRow("", self._btn_save_api)
+
+        self._update_provider_visibility()
         return grp
+
+    def _update_provider_visibility(self) -> None:
+        is_audd = self._combo_provider.currentData() != "acrcloud"
+        for lbl, widget in (self._row_audd_key, self._row_audd_link):
+            lbl.setVisible(is_audd)
+            widget.setVisible(is_audd)
+        for lbl, widget in (self._row_acr_key, self._row_acr_secret, self._row_acr_host, self._row_acr_link):
+            lbl.setVisible(not is_audd)
+            widget.setVisible(not is_audd)
 
     def _build_display_group(self) -> QGroupBox:
         grp = QGroupBox("Exibição")
@@ -190,18 +247,32 @@ class SettingsDialog(QDialog):
 
     def _connect(self) -> None:
         self._btn_save_api.clicked.connect(self._save_api)
+        self._combo_provider.currentIndexChanged.connect(self._update_provider_visibility)
         self._btn_apply.clicked.connect(self._save_display)
         self._slider_opacity.valueChanged.connect(self._live_opacity)
         self._chk_aot.toggled.connect(self._live_aot)
 
     @pyqtSlot()
     def _save_api(self) -> None:
+        provider = self._combo_provider.currentData()
+        self._config.set("Recognition", "recognition_provider", provider)
         self._config.set("API", "audd_api_key",       self._edit_audd.text().strip())
         self._config.set("API", "musixmatch_api_key", self._edit_mx.text().strip())
+        self._config.set("ACRCloud", "access_key",    self._edit_acr_key.text().strip())
+        self._config.set("ACRCloud", "access_secret", self._edit_acr_secret.text().strip())
+        self._config.set("ACRCloud", "host",          self._edit_acr_host.text().strip())
         self._config.save()
-        self._worker.recognizer.api_key = self._edit_audd.text().strip()
-        self._btn_save_api.setText("Salvo ✓")
-        QTimer.singleShot(2000, lambda: self._btn_save_api.setText("Salvar chaves de API"))
+        # Update running recognizer credentials (no restart needed for same provider).
+        rec = self._worker.recognizer
+        from src.song_recognition import AudDRecognizer, ACRCloudRecognizer
+        if isinstance(rec, AudDRecognizer):
+            rec.api_key = self._edit_audd.text().strip()
+        elif isinstance(rec, ACRCloudRecognizer):
+            rec.access_key    = self._edit_acr_key.text().strip()
+            rec.access_secret = self._edit_acr_secret.text().strip()
+            rec.host          = self._edit_acr_host.text().strip()
+        self._btn_save_api.setText("Salvo ✓ (reinicie para trocar provedor)")
+        QTimer.singleShot(3000, lambda: self._btn_save_api.setText("Salvar configurações de API"))
 
     @pyqtSlot()
     def _save_display(self) -> None:

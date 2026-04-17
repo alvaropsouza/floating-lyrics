@@ -6,6 +6,7 @@ the main control window together with the floating lyrics overlay.
 """
 
 import logging
+import logging.handlers
 import sys
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from PyQt6.QtCore import Qt
 
 from config import Config
 from src.audio_capture import AudioCapture, AudioCaptureError
-from src.song_recognition import AudDRecognizer
+from src.song_recognition import AudDRecognizer, ACRCloudRecognizer
 from src.lyrics_fetcher import LyricsFetcher
 from src.worker import RecognitionWorker
 from src.ui.main_window import MainWindow
@@ -42,10 +43,15 @@ def _build_tray_icon() -> QIcon:
 
 
 def main() -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+    log_file = Path(__file__).parent / "floating_lyrics.log"
+    _handlers: list[logging.Handler] = [
+        logging.StreamHandler(),
+        logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8"
+        ),
+    ]
+    _fmt = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    logging.basicConfig(level=logging.INFO, format=_fmt, handlers=_handlers)
 
     app = QApplication(sys.argv)
     app.setApplicationName("Floating Lyrics")
@@ -74,7 +80,15 @@ def main() -> int:
         return 1
 
     # ── Sub-components ─────────────────────────────────────────────────────
-    recognizer = AudDRecognizer(config.get("API", "audd_api_key"))
+    provider = config.get("Recognition", "recognition_provider", fallback="audd").strip().lower()
+    if provider == "acrcloud":
+        recognizer = ACRCloudRecognizer(
+            access_key=config.get("ACRCloud", "access_key", fallback=""),
+            access_secret=config.get("ACRCloud", "access_secret", fallback=""),
+            host=config.get("ACRCloud", "host", fallback="identify-eu-west-1.acrcloud.com"),
+        )
+    else:
+        recognizer = AudDRecognizer(config.get("API", "audd_api_key", fallback=""))
     lyrics_fetcher = LyricsFetcher(config)
 
     worker = RecognitionWorker(config, audio_capture, recognizer, lyrics_fetcher)

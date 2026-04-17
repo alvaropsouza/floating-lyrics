@@ -10,11 +10,15 @@ Prioridade:
 
 from __future__ import annotations
 
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional
 
 import requests
+
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass
@@ -53,16 +57,66 @@ class LrcLibFetcher:
     ) -> Optional[LyricsResult]:
         duration = max(0, int(duration_s or 0))
 
-        # First pass: try exact/nearby signature durations to avoid wrong versions.
-        for dur_try in self._duration_candidates(duration):
-            data = self._get_by_signature(title, artist, album, dur_try)
-            if data is not None:
-                result = self._parse_response(data)
-                if result is not None:
-                    return result
+        # Fire all duration candidates in parallel to avoid sequential HTTP waits.
+        candidates = self._duration_candidates(duration)
+        if len(candidates) == 1:
+            # Only one candidate (e.g. duration unknown) — no need for a thread pool.
+            data = self._get_by_signature(title, artist, album, candidates[0])
+            result = self._parse_response(data) if data is not None else None
+        else:
+            result = self._parallel_get(title, artist, album, candidates)
+
+        if result is not None:
+            return result
 
         # No signature match: search and rank by title/artist similarity + duration.
         return self._search(title, artist, duration)
+
+    @staticmethod
+    def _fetch_one_candidate(base_url: str, title: str, artist: str, album: str, dur: int, timeout: int) -> Optional[LyricsResult]:
+        session = requests.Session()
+        session.headers.update({"User-Agent": "FloatingLyrics/1.0 (https://github.com/floating-lyrics)"})
+        params: dict = {"track_name": title, "artist_name": artist}
+        if album:
+            params["album_name"] = album
+        if dur > 0:
+            params["duration"] = dur
+        try:
+            r = session.get(f"{base_url}/get", params=params, timeout=timeout)
+            if r.status_code == 200:
+                return LrcLibFetcher._parse_response(r.json())
+        except Exception:
+            pass
+        finally:
+            session.close()
+        return None
+
+    def _parallel_get(
+        self,
+        title: str,
+        artist: str,
+        album: str,
+        candidates: list[int],
+    ) -> Optional[LyricsResult]:
+        """Fire all /get duration candidates concurrently; return first synced hit, else first plain."""
+        best_plain: Optional[LyricsResult] = None
+        base_url, timeout = self.BASE_URL, self.TIMEOUT
+        with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+            futures = {
+                pool.submit(self._fetch_one_candidate, base_url, title, artist, album, d, timeout): d
+                for d in candidates
+            }
+            for fut in as_completed(futures):
+                res = fut.result()
+                if res is None:
+                    continue
+                if res.synced:
+                    for f in futures:
+                        f.cancel()
+                    return res
+                if best_plain is None:
+                    best_plain = res
+        return best_plain
 
     def _get_by_signature(
         self,
@@ -82,6 +136,7 @@ class LrcLibFetcher:
                 f"{self.BASE_URL}/get", params=params, timeout=self.TIMEOUT
             )
         except requests.RequestException:
+            _LOG.warning("lrclib /get falhou", exc_info=True)
             return None
 
         if r.status_code != 200:
@@ -210,6 +265,7 @@ class MusixmatchFetcher:
             r.raise_for_status()
             tracks = r.json()["message"]["body"]["track_list"]
         except Exception:
+            _LOG.warning("Musixmatch track search falhou", exc_info=True)
             return None
 
         if not tracks:
@@ -226,6 +282,7 @@ class MusixmatchFetcher:
             r.raise_for_status()
             body = r.json()["message"]["body"]["lyrics"]["lyrics_body"]
         except Exception:
+            _LOG.warning("Musixmatch get lyrics falhou", exc_info=True)
             return None
 
         if not body:
