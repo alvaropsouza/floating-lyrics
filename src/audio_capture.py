@@ -1,0 +1,191 @@
+"""
+Captura de áudio via WASAPI loopback (saída do sistema, não microfone).
+
+Dependência: pyaudiowpatch — fork do PyAudio com suporte nativo a WASAPI
+loopback no Windows.  Instale com:  pip install pyaudiowpatch
+"""
+
+import io
+import math
+import struct
+import wave
+from typing import Optional
+
+try:
+    import pyaudiowpatch as pyaudio  # type: ignore
+    _PYAUDIO_AVAILABLE = True
+except ImportError:
+    _PYAUDIO_AVAILABLE = False
+
+
+class AudioCaptureError(Exception):
+    """Raised for any audio-capture related failure."""
+
+
+class AudioCapture:
+    """
+    Captures the Windows system audio output (loopback) using WASAPI.
+
+    Usage::
+
+        cap = AudioCapture(config)
+        cap.initialize()          # call once at startup
+        wav_bytes = cap.capture(10)   # capture 10 s → WAV bytes
+        cap.cleanup()             # call on exit
+    """
+
+    def __init__(self, config) -> None:
+        self._config = config
+        self._pa: Optional[object] = None
+
+    # ── Lifecycle ───────────────────────────────────────────────────────────
+
+    def initialize(self) -> None:
+        """
+        Initialise PyAudio and verify that a WASAPI loopback device exists.
+
+        Raises:
+            AudioCaptureError: if pyaudiowpatch is missing or no loopback
+                device is found.
+        """
+        if not _PYAUDIO_AVAILABLE:
+            raise AudioCaptureError(
+                "pyaudiowpatch não está instalado.\n"
+                "Execute no terminal:  pip install pyaudiowpatch"
+            )
+        self._pa = pyaudio.PyAudio()
+        # Probe the loopback device early so the error surfaces at startup.
+        self._get_loopback_device()
+
+    def cleanup(self) -> None:
+        """Release PyAudio resources."""
+        if self._pa is not None:
+            try:
+                self._pa.terminate()
+            except Exception:
+                pass
+            finally:
+                self._pa = None
+
+    # ── Device discovery ────────────────────────────────────────────────────
+
+    def _get_loopback_device(self) -> dict:
+        """
+        Return the WASAPI loopback device info dict for the current default
+        audio output.
+
+        Raises:
+            AudioCaptureError: if WASAPI is unavailable or no loopback device
+                is found.
+        """
+        try:
+            wasapi_info = self._pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        except OSError:
+            raise AudioCaptureError(
+                "WASAPI não está disponível neste sistema.\n"
+                "Este recurso requer Windows Vista ou superior com drivers WASAPI."
+            )
+
+        default_out_idx: int = wasapi_info.get("defaultOutputDevice", -1)
+        if default_out_idx < 0:
+            raise AudioCaptureError(
+                "Nenhum dispositivo de saída de áudio padrão encontrado.\n"
+                "Verifique se há alto-falantes ou fones conectados."
+            )
+
+        default_out = self._pa.get_device_info_by_index(default_out_idx)
+
+        # Some drivers already expose the loopback variant directly.
+        if default_out.get("isLoopbackDevice", False):
+            return default_out
+
+        # Search among all loopback devices for the one matching our output.
+        try:
+            for loopback in self._pa.get_loopback_device_info_generator():
+                if default_out["name"] in loopback["name"]:
+                    return loopback
+        except Exception:
+            pass
+
+        raise AudioCaptureError(
+            f"Nenhum dispositivo de loopback encontrado para "
+            f"'{default_out['name']}'.\n"
+            "Certifique-se de que o dispositivo de saída está ativo e "
+            "tente reiniciar o aplicativo."
+        )
+
+    # ── Silence detection ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _rms(raw_bytes: bytes) -> float:
+        """Compute Root-Mean-Square of 16-bit little-endian PCM samples."""
+        count = len(raw_bytes) // 2
+        if count == 0:
+            return 0.0
+        shorts = struct.unpack_from(f"<{count}h", raw_bytes)
+        return math.sqrt(sum(s * s for s in shorts) / count)
+
+    # ── Capture ─────────────────────────────────────────────────────────────
+
+    def capture(self, duration: int) -> bytes:
+        """
+        Record *duration* seconds of system audio via WASAPI loopback.
+
+        Returns:
+            WAV-formatted bytes suitable for sending to a recognition API.
+
+        Raises:
+            AudioCaptureError: if the capture device is unavailable, no
+                audio is detected (silence), or any other recording error.
+        """
+        if self._pa is None:
+            raise AudioCaptureError(
+                "AudioCapture não foi inicializado. Chame initialize() antes."
+            )
+
+        device = self._get_loopback_device()
+        sample_rate: int = int(device["defaultSampleRate"])
+        channels: int = min(int(device["maxInputChannels"]), 2) or 1
+        chunk: int = 1024
+        frames: list[bytes] = []
+
+        stream = self._pa.open(
+            format=pyaudio.paInt16,
+            channels=channels,
+            rate=sample_rate,
+            input=True,
+            input_device_index=int(device["index"]),
+            frames_per_buffer=chunk,
+        )
+        try:
+            total_chunks = int((sample_rate / chunk) * duration)
+            for _ in range(total_chunks):
+                data = stream.read(chunk, exception_on_overflow=False)
+                frames.append(data)
+        except OSError as exc:
+            raise AudioCaptureError(f"Erro durante a gravação: {exc}") from exc
+        finally:
+            stream.stop_stream()
+            stream.close()
+
+        raw_audio = b"".join(frames)
+
+        # ── Silence check ───────────────────────────────────────────────────
+        threshold = self._config.getint("Recognition", "silence_threshold", fallback=100)
+        rms = self._rms(raw_audio)
+        if rms < threshold:
+            raise AudioCaptureError(
+                f"Nenhum áudio detectado no sistema (RMS = {rms:.1f}, "
+                f"limiar = {threshold}).\n"
+                "Verifique se algo está tocando e se o volume não está zerado."
+            )
+
+        # ── Encode as WAV ───────────────────────────────────────────────────
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(channels)
+            wf.setsampwidth(self._pa.get_sample_size(pyaudio.paInt16))
+            wf.setframerate(sample_rate)
+            wf.writeframes(raw_audio)
+
+        return buf.getvalue()
