@@ -365,6 +365,7 @@ class LyricsWindow(QWidget):
         self._worker.status_changed.connect(self._on_status)
         self._worker.song_found.connect(self._on_song_found)
         self._worker.song_not_found.connect(self._on_song_not_found)
+        self._worker.lyrics_loading.connect(self._on_lyrics_loading)
         self._worker.lyrics_ready.connect(self._on_lyrics_ready)
         self._worker.lyrics_not_found.connect(self._on_lyrics_not_found)
         self._worker.timecode_updated.connect(self._on_timecode_updated)
@@ -382,6 +383,16 @@ class LyricsWindow(QWidget):
     @pyqtSlot()
     def _on_song_not_found(self) -> None:
         pass  # status_changed carries the user-visible message
+
+    @pyqtSlot()
+    def _on_lyrics_loading(self) -> None:
+        """Show a loading placeholder while lyrics are being fetched."""
+        self._sync_timer.stop()
+        self._lrc_lines   = []
+        self._plain_lines = []
+        self._is_synced   = False
+        self._current_idx = -1
+        self._load_labels(["Carregando letra…"])
 
     @pyqtSlot(str, bool, float)
     def _on_lyrics_ready(self, content: str, synced: bool, capture_start: float) -> None:
@@ -407,7 +418,12 @@ class LyricsWindow(QWidget):
 
     @pyqtSlot()
     def _on_lyrics_not_found(self) -> None:
-        pass  # status_changed carries the message
+        self._sync_timer.stop()
+        self._lrc_lines   = []
+        self._plain_lines = []
+        self._is_synced   = False
+        self._current_idx = -1
+        self._load_labels(["Letra não encontrada"])
 
     @pyqtSlot(int, float)
     def _on_timecode_updated(self, timecode_ms: int, capture_start: float) -> None:

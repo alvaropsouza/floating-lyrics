@@ -6,10 +6,13 @@ loopback no Windows.  Instale com:  pip install pyaudiowpatch
 """
 
 import io
+import logging
 import math
 import struct
 import wave
 from typing import Optional
+
+_LOG = logging.getLogger(__name__)
 
 try:
     import pyaudiowpatch as pyaudio  # type: ignore
@@ -63,7 +66,7 @@ class AudioCapture:
             try:
                 self._pa.terminate()
             except Exception:
-                pass
+                _LOG.debug("Erro ao terminar PyAudio", exc_info=True)
             finally:
                 self._pa = None
 
@@ -75,6 +78,7 @@ class AudioCapture:
             for dev in self._pa.get_loopback_device_info_generator():
                 devices.append(dev)
         except Exception:
+            _LOG.warning("Falha ao listar dispositivos loopback", exc_info=True)
             return []
         return devices
 
@@ -164,7 +168,7 @@ class AudioCapture:
             "tente reiniciar o aplicativo."
         )
 
-    # ── Silence detection ───────────────────────────────────────────────────
+    # ── Silence detection / normalization ───────────────────────────────────
 
     @staticmethod
     def _rms(raw_bytes: bytes) -> float:
@@ -174,6 +178,31 @@ class AudioCapture:
             return 0.0
         shorts = struct.unpack_from(f"<{count}h", raw_bytes)
         return math.sqrt(sum(s * s for s in shorts) / count)
+
+    @staticmethod
+    def _normalize(raw_bytes: bytes) -> bytes:
+        """
+        Scale 16-bit PCM to full dynamic range so recognition APIs receive
+        audio at maximum amplitude regardless of the current system volume.
+
+        If the audio is already at or near peak (peak >= 28000) it is returned
+        unchanged to avoid integer overflow artifacts.
+        """
+        count = len(raw_bytes) // 2
+        if count == 0:
+            return raw_bytes
+        fmt = f"<{count}h"
+        samples = struct.unpack_from(fmt, raw_bytes)
+        peak = max(abs(s) for s in samples)
+        if peak < 10:
+            # Effectively silent — nothing to normalize.
+            return raw_bytes
+        if peak >= 28000:
+            # Already loud enough; skip to avoid clipping.
+            return raw_bytes
+        gain = 32767.0 / peak
+        normalized = bytes(struct.pack(fmt, *(max(-32768, min(32767, int(s * gain))) for s in samples)))
+        return normalized
 
     # ── Capture ─────────────────────────────────────────────────────────────
 
@@ -220,15 +249,20 @@ class AudioCapture:
 
         raw_audio = b"".join(frames)
 
-        # ── Silence check ───────────────────────────────────────────────────
-        threshold = self._config.getint("Recognition", "silence_threshold", fallback=100)
-        rms = self._rms(raw_audio)
-        if rms < threshold:
+        # ── Silence check (before normalization, on raw signal) ─────────────
+        # Use a very low threshold here — just enough to reject true silence.
+        # The actual normalization will happen next, so the API always gets
+        # a loud signal regardless of system volume.
+        raw_rms = self._rms(raw_audio)
+        _LOG.debug("RMS do áudio bruto: %.1f", raw_rms)
+        if raw_rms < 5:
             raise AudioCaptureError(
-                f"Nenhum áudio detectado no sistema (RMS = {rms:.1f}, "
-                f"limiar = {threshold}).\n"
-                "Verifique se algo está tocando e se o volume não está zerado."
+                f"Nenhum áudio detectado no sistema (RMS = {raw_rms:.1f}).\n"
+                "Verifique se algo está tocando."
             )
+
+        # ── Normalize to full amplitude for better recognition ───────────────
+        raw_audio = self._normalize(raw_audio)
 
         # ── Encode as WAV ───────────────────────────────────────────────────
         buf = io.BytesIO()

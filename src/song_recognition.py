@@ -17,14 +17,25 @@ Resposta relevante da API:
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import logging
+import time as _time
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import requests
 
+_LOG = logging.getLogger(__name__)
+
 
 class RecognitionError(Exception):
     """Raised for any song-recognition failure."""
+
+
+class RateLimitError(RecognitionError):
+    """Raised when the recognition API reports a rate-limit / quota error."""
 
 
 @dataclass
@@ -93,14 +104,17 @@ class AudDRecognizer:
             )
             resp.raise_for_status()
         except requests.Timeout:
+            _LOG.warning("AudD timeout")
             raise RecognitionError(
                 "Timeout ao conectar ao AudD. Verifique sua conexão com a internet."
             )
         except requests.ConnectionError:
+            _LOG.warning("AudD sem conexão")
             raise RecognitionError(
                 "Sem conexão com o AudD. Verifique sua internet."
             )
         except requests.HTTPError as exc:
+            _LOG.error("AudD HTTP %s", exc.response.status_code)
             raise RecognitionError(
                 f"Erro HTTP {exc.response.status_code} do AudD."
             ) from exc
@@ -173,10 +187,10 @@ class AudDRecognizer:
             err = payload.get("error", {})
             code = err.get("error_code", 0)
             msg = err.get("error_message", "Erro desconhecido")
-            if code == 901:
-                raise RecognitionError(
-                    "Limite da API AudD atingido.\n"
-                    "Obtenha uma chave gratuita em https://dashboard.audd.io/"
+            if code in (901, 902):
+                raise RateLimitError(
+                    f"Limite da API AudD atingido (erro {code})."
+                    " Tentativas pausadas por 30 minutos."
                 )
             raise RecognitionError(f"AudD retornou erro {code}: {msg}")
 
@@ -191,6 +205,159 @@ class AudDRecognizer:
             duration_s=self._extract_duration_s(result),
             confidence=self._extract_confidence(result),
             timecode_ms=self._timecode_to_ms(result.get("timecode", "")),
+        )
+
+    def __del__(self) -> None:
+        try:
+            self._session.close()
+        except Exception:
+            pass
+
+
+# ── ACRCloud recognizer ──────────────────────────────────────────────────────
+
+class ACRCloudRecognizer:
+    """
+    Identifies songs using the ACRCloud REST API.
+
+    Free tier: 1000 requests/day.
+    Sign up at: https://console.acrcloud.com/
+
+    Required config keys in [ACRCloud]:
+      access_key     — your project access key
+      access_secret  — your project access secret
+      host           — e.g. identify-eu-west-1.acrcloud.com
+    """
+
+    TIMEOUT_S = 30
+
+    def __init__(self, access_key: str = "", access_secret: str = "", host: str = "") -> None:
+        self.access_key    = access_key.strip()
+        self.access_secret = access_secret.strip()
+        self.host          = host.strip().rstrip("/")
+        self._session = requests.Session()
+        self._session.headers.update({"User-Agent": "FloatingLyrics/1.0"})
+        # Compatibility shim so SettingsDialog can access api_key generically.
+        self.api_key = access_key
+
+    @property
+    def _endpoint(self) -> str:
+        return f"https://{self.host}/v1/identify"
+
+    def _sign(self, timestamp: str) -> str:
+        string_to_sign = "\n".join([
+            "POST",
+            "/v1/identify",
+            self.access_key,
+            "audio",
+            "1",
+            timestamp,
+        ])
+        return base64.b64encode(
+            hmac.new(
+                self.access_secret.encode("ascii"),
+                string_to_sign.encode("ascii"),
+                digestmod=hashlib.sha1,
+            ).digest()
+        ).decode("ascii")
+
+    def recognize(
+        self, audio_bytes: bytes, capture_start_time: float
+    ) -> Tuple[Optional[SongInfo], float]:
+        if not self.access_key or not self.access_secret or not self.host:
+            raise RecognitionError(
+                "ACRCloud não configurado.\n"
+                "Preencha access_key, access_secret e host em Configurações."
+            )
+
+        timestamp = str(int(_time.time()))
+        signature = self._sign(timestamp)
+
+        data = {
+            "access_key":        self.access_key,
+            "data_type":         "audio",
+            "signature_version": "1",
+            "signature":         signature,
+            "sample_bytes":      str(len(audio_bytes)),
+            "timestamp":         timestamp,
+        }
+
+        try:
+            resp = self._session.post(
+                self._endpoint,
+                data=data,
+                files={"sample": ("audio.wav", audio_bytes, "audio/wav")},
+                timeout=self.TIMEOUT_S,
+            )
+            resp.raise_for_status()
+        except requests.Timeout:
+            _LOG.warning("ACRCloud timeout")
+            raise RecognitionError("Timeout ao conectar ao ACRCloud.")
+        except requests.ConnectionError:
+            _LOG.warning("ACRCloud sem conexão")
+            raise RecognitionError("Sem conexão com o ACRCloud.")
+        except requests.HTTPError as exc:
+            _LOG.error("ACRCloud HTTP %s", exc.response.status_code)
+            raise RecognitionError(f"Erro HTTP {exc.response.status_code} do ACRCloud.") from exc
+
+        try:
+            payload = resp.json()
+        except ValueError:
+            raise RecognitionError("Resposta inesperada do ACRCloud (não é JSON).")
+
+        song = self._parse(payload)
+        return song, capture_start_time
+
+    @staticmethod
+    def _parse_timecode(m: dict) -> int:
+        for key in ("play_offset_ms", "sample_begin_time_offset_ms"):
+            val = m.get(key)
+            if val is not None:
+                try:
+                    return max(0, int(float(val)))
+                except (TypeError, ValueError):
+                    pass
+        return 0
+
+    @staticmethod
+    def _parse_score(m: dict) -> Optional[float]:
+        try:
+            return float(m.get("score", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _parse(payload: dict) -> Optional[SongInfo]:
+        status = payload.get("status", {})
+        code   = status.get("code", -1)
+        if code == 1001:
+            return None
+        if code != 0:
+            msg = status.get("msg", "Erro desconhecido")
+            raise RecognitionError(f"ACRCloud erro {code}: {msg}")
+
+        music_list = (payload.get("metadata") or {}).get("music") or []
+        if not music_list:
+            return None
+
+        m      = music_list[0]
+        title  = m.get("title", "").strip()
+        artist = ", ".join(a.get("name", "") for a in (m.get("artists") or [{}]))
+        album  = (m.get("album") or {}).get("name", "").strip()
+
+        duration_ms = m.get("duration_ms") or 0
+        try:
+            duration_s = max(0, int(float(duration_ms)) // 1000)
+        except (TypeError, ValueError):
+            duration_s = 0
+
+        return SongInfo(
+            title=title,
+            artist=artist,
+            album=album,
+            duration_s=duration_s,
+            confidence=ACRCloudRecognizer._parse_score(m),
+            timecode_ms=ACRCloudRecognizer._parse_timecode(m),
         )
 
     def __del__(self) -> None:
