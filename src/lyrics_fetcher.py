@@ -11,6 +11,7 @@ Prioridade:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from typing import Optional
 
 import requests
@@ -50,10 +51,30 @@ class LrcLibFetcher:
         album: str = "",
         duration_s: int = 0,
     ) -> Optional[LyricsResult]:
+        duration = max(0, int(duration_s or 0))
+
+        # First pass: try exact/nearby signature durations to avoid wrong versions.
+        for dur_try in self._duration_candidates(duration):
+            data = self._get_by_signature(title, artist, album, dur_try)
+            if data is not None:
+                result = self._parse_response(data)
+                if result is not None:
+                    return result
+
+        # No signature match: search and rank by title/artist similarity + duration.
+        return self._search(title, artist, duration)
+
+    def _get_by_signature(
+        self,
+        title: str,
+        artist: str,
+        album: str,
+        duration_s: int,
+    ) -> Optional[dict]:
         params: dict = {"track_name": title, "artist_name": artist}
         if album:
             params["album_name"] = album
-        if duration_s:
+        if duration_s > 0:
             params["duration"] = duration_s
 
         try:
@@ -63,19 +84,15 @@ class LrcLibFetcher:
         except requests.RequestException:
             return None
 
-        if r.status_code == 404:
-            return self._search(title, artist)
         if r.status_code != 200:
             return None
 
         try:
-            data = r.json()
+            return r.json()
         except ValueError:
             return None
 
-        return self._parse_response(data)
-
-    def _search(self, title: str, artist: str) -> Optional[LyricsResult]:
+    def _search(self, title: str, artist: str, duration_s: int = 0) -> Optional[LyricsResult]:
         """Use the lrclib search endpoint as a second attempt."""
         try:
             r = self._session.get(
@@ -91,7 +108,46 @@ class LrcLibFetcher:
         if not isinstance(results, list) or not results:
             return None
 
-        return self._parse_response(results[0])
+        ranked = sorted(
+            results,
+            key=lambda item: self._score_candidate(item, title, artist, duration_s),
+            reverse=True,
+        )
+        for item in ranked:
+            parsed = self._parse_response(item)
+            if parsed is not None:
+                return parsed
+        return None
+
+    @staticmethod
+    def _duration_candidates(duration_s: int) -> list[int]:
+        if duration_s <= 0:
+            return [0]
+        candidates = [duration_s]
+        for delta in (1, 2):
+            if duration_s - delta > 0:
+                candidates.append(duration_s - delta)
+            candidates.append(duration_s + delta)
+        return candidates
+
+    @staticmethod
+    def _score_candidate(item: dict, title: str, artist: str, duration_s: int) -> float:
+        track_name = str(item.get("trackName") or item.get("track_name") or "")
+        artist_name = str(item.get("artistName") or item.get("artist_name") or "")
+        title_sim = SequenceMatcher(None, title.lower(), track_name.lower()).ratio()
+        artist_sim = SequenceMatcher(None, artist.lower(), artist_name.lower()).ratio()
+
+        duration_sim = 0.0
+        cand_duration = item.get("duration")
+        try:
+            cand_duration = int(cand_duration)
+        except (TypeError, ValueError):
+            cand_duration = 0
+        if duration_s > 0 and cand_duration > 0:
+            diff = abs(duration_s - cand_duration)
+            duration_sim = max(0.0, 1.0 - diff / 10.0)
+
+        return 0.55 * title_sim + 0.35 * artist_sim + 0.10 * duration_sim
 
     @staticmethod
     def _parse_response(data: dict) -> Optional[LyricsResult]:
@@ -217,7 +273,7 @@ class LyricsFetcher:
             title.strip().lower(),
             artist.strip().lower(),
             album.strip().lower(),
-            max(0, int(duration_s or 0)),
+            int(round(max(0, int(duration_s or 0)) / 2.0) * 2),
         )
 
     def fetch(

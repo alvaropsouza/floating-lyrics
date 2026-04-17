@@ -5,6 +5,7 @@ Initialises all components, creates the Qt application and launches
 the main control window together with the floating lyrics overlay.
 """
 
+import logging
 import sys
 from pathlib import Path
 
@@ -41,6 +42,11 @@ def _build_tray_icon() -> QIcon:
 
 
 def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
     app = QApplication(sys.argv)
     app.setApplicationName("Floating Lyrics")
     app.setApplicationVersion("1.0.0")

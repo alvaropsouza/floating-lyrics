@@ -17,7 +17,7 @@ Resposta relevante da API:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import requests
@@ -33,6 +33,7 @@ class SongInfo:
     artist: str
     album: str = ""
     duration_s: int = 0
+    confidence: Optional[float] = None
     # Position (ms) in the song where our audio sample begins — from AudD's
     # `timecode` field.  Used to synchronise LRC lyrics.
     timecode_ms: int = 0
@@ -126,6 +127,47 @@ class AudDRecognizer:
             pass
         return 0
 
+    @staticmethod
+    def _safe_int(value) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return 0
+
+    def _extract_duration_s(self, result: dict) -> int:
+        # AudD fields can vary by source; try common places.
+        direct = self._safe_int(result.get("duration"))
+        if direct > 0:
+            return direct
+
+        spotify = result.get("spotify") or {}
+        spotify_ms = self._safe_int(spotify.get("duration_ms"))
+        if spotify_ms > 0:
+            return max(1, spotify_ms // 1000)
+
+        apple = result.get("apple_music") or {}
+        apple_ms = self._safe_int(
+            apple.get("durationInMillis")
+            or apple.get("duration_in_millis")
+            or apple.get("duration_ms")
+        )
+        if apple_ms > 0:
+            return max(1, apple_ms // 1000)
+
+        return 0
+
+    @staticmethod
+    def _extract_confidence(result: dict) -> Optional[float]:
+        # Some responses use `score`; others may expose `confidence`.
+        for key in ("score", "confidence"):
+            val = result.get(key)
+            try:
+                if val is not None:
+                    return float(val)
+            except (TypeError, ValueError):
+                continue
+        return None
+
     def _parse(self, payload: dict) -> Optional[SongInfo]:
         if payload.get("status") == "error":
             err = payload.get("error", {})
@@ -146,6 +188,8 @@ class AudDRecognizer:
             title=result.get("title", "").strip(),
             artist=result.get("artist", "").strip(),
             album=result.get("album", "").strip(),
+            duration_s=self._extract_duration_s(result),
+            confidence=self._extract_confidence(result),
             timecode_ms=self._timecode_to_ms(result.get("timecode", "")),
         )
 

@@ -103,6 +103,12 @@ musixmatch_api_key = sua_chave_aqui
 python main.py
 ```
 
+Modo desenvolvimento (reinicio automatico ao salvar alteracoes):
+
+```bash
+python dev_auto_restart.py
+```
+
 A janela de controle abrirá junto com o overlay de letras.
 
 1. Insira sua chave AudD → clique **"Salvar chaves"**
@@ -135,6 +141,29 @@ A janela de controle abrirá junto com o overlay de letras.
 - **Arrastar:** clique e segure em qualquer área do overlay.
 - **Redimensionar:** arraste o canto inferior direito (triângulo cinza).
 - **Menu rápido:** clique com o botão direito no overlay.
+
+---
+
+## Ignorar áudio do Discord (roteamento por dispositivo)
+
+O Windows loopback captura o áudio do dispositivo de saída inteiro. Para excluir
+o Discord, configure o Discord para tocar em outro dispositivo e faça o app
+capturar apenas o dispositivo principal da música.
+
+No `config.ini`, seção `Audio`:
+
+```ini
+[Audio]
+capture_device_index = -1
+capture_device_name = Speakers
+```
+
+Regras:
+- `capture_device_index >= 0`: usa esse índice exato (prioridade maior)
+- `capture_device_name`: busca por nome parcial (ex.: `Speakers`, `Headphones`)
+- se ambos vazios/default, usa o dispositivo padrão do Windows
+
+Depois de alterar, reinicie o app.
 
 ---
 

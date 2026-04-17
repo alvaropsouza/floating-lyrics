@@ -69,6 +69,52 @@ class AudioCapture:
 
     # ── Device discovery ────────────────────────────────────────────────────
 
+    def _list_loopback_devices(self) -> list[dict]:
+        devices: list[dict] = []
+        try:
+            for dev in self._pa.get_loopback_device_info_generator():
+                devices.append(dev)
+        except Exception:
+            return []
+        return devices
+
+    def _preferred_loopback_device(self) -> Optional[dict]:
+        """
+        Resolve a user-preferred loopback device by index or partial name.
+
+        Config keys (section [Audio]):
+          - capture_device_index (int, default -1)
+          - capture_device_name (string, partial match)
+        """
+        loopbacks = self._list_loopback_devices()
+        if not loopbacks:
+            return None
+
+        preferred_idx = self._config.getint("Audio", "capture_device_index", fallback=-1)
+        if preferred_idx >= 0:
+            for dev in loopbacks:
+                if int(dev.get("index", -1)) == preferred_idx:
+                    return dev
+            available = ", ".join(str(int(dev.get("index", -1))) for dev in loopbacks)
+            raise AudioCaptureError(
+                "capture_device_index inválido no config.ini. "
+                f"Índices disponíveis: {available}"
+            )
+
+        preferred_name = self._config.get("Audio", "capture_device_name", fallback="").strip().lower()
+        if preferred_name:
+            for dev in loopbacks:
+                name = str(dev.get("name", "")).lower()
+                if preferred_name in name:
+                    return dev
+            names = "; ".join(str(dev.get("name", "")) for dev in loopbacks)
+            raise AudioCaptureError(
+                "capture_device_name não encontrado no config.ini. "
+                f"Dispositivos loopback disponíveis: {names}"
+            )
+
+        return None
+
     def _get_loopback_device(self) -> dict:
         """
         Return the WASAPI loopback device info dict for the current default
@@ -78,6 +124,10 @@ class AudioCapture:
             AudioCaptureError: if WASAPI is unavailable or no loopback device
                 is found.
         """
+        preferred = self._preferred_loopback_device()
+        if preferred is not None:
+            return preferred
+
         try:
             wasapi_info = self._pa.get_host_api_info_by_type(pyaudio.paWASAPI)
         except OSError:
