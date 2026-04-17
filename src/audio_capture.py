@@ -225,21 +225,49 @@ class AudioCapture:
         device = self._get_loopback_device()
         sample_rate: int = int(device["defaultSampleRate"])
         channels: int = min(int(device["maxInputChannels"]), 2) or 1
-        chunk: int = 1024
         frames: list[bytes] = []
 
-        stream = self._pa.open(
-            format=pyaudio.paInt16,
-            channels=channels,
-            rate=sample_rate,
-            input=True,
-            input_device_index=int(device["index"]),
-            frames_per_buffer=chunk,
-        )
+        # Let the WASAPI driver pick the optimal buffer size first (0 = unspecified).
+        # Fall back to explicit sizes if the driver rejects paFramesPerBufferUnspecified.
+        chunk_candidates = [0, 512, 1024, 2048, 4096]
+        stream = None
+        last_exc: Exception | None = None
+        for chunk in chunk_candidates:
+            try:
+                stream = self._pa.open(
+                    format=pyaudio.paInt16,
+                    channels=channels,
+                    rate=sample_rate,
+                    input=True,
+                    input_device_index=int(device["index"]),
+                    frames_per_buffer=chunk,
+                )
+                break
+            except OSError as exc:
+                _LOG.debug("Falha ao abrir stream com chunk=%d: %s", chunk, exc)
+                last_exc = exc
+                # Re-initialize PyAudio for the next attempt — a failed open can
+                # leave the WASAPI handle in a broken state.
+                try:
+                    self._pa.terminate()
+                except Exception:
+                    pass
+                self._pa = pyaudio.PyAudio()
+
+        if stream is None:
+            raise AudioCaptureError(
+                f"Não foi possível abrir o stream de áudio após {len(chunk_candidates)} tentativas.\n"
+                f"Último erro: {last_exc}\n"
+                "Tente trocar o dispositivo de saída de áudio ou reiniciar o aplicativo."
+            )
+
+        # Use a fixed read chunk of 1024 for the read loop regardless of the
+        # buffer size used to open the stream.
+        read_chunk = 1024 if chunk == 0 else chunk
         try:
-            total_chunks = int((sample_rate / chunk) * duration)
+            total_chunks = int((sample_rate / read_chunk) * duration)
             for _ in range(total_chunks):
-                data = stream.read(chunk, exception_on_overflow=False)
+                data = stream.read(read_chunk, exception_on_overflow=False)
                 frames.append(data)
         except OSError as exc:
             raise AudioCaptureError(f"Erro durante a gravação: {exc}") from exc
