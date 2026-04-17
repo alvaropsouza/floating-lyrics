@@ -10,7 +10,9 @@ Prioridade:
 
 from __future__ import annotations
 
+import json as _json
 import logging
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -30,7 +32,25 @@ class LyricsResult:
     raw_lrc: str = ""  # Full LRC text (only when synced=True)
 
 
-# ── lrclib.net ──────────────────────────────────────────────────────────────
+
+def _safe_json(response: requests.Response) -> object:
+    """Parse JSON always as UTF-8, regardless of what requests infers."""
+    return _json.loads(response.content.decode("utf-8"))
+
+
+def _normalize_str(s: str) -> str:
+    """NFC-normalize and lowercase for consistent unicode comparison."""
+    return unicodedata.normalize("NFC", s).lower()
+
+
+def _strip_accents(s: str) -> str:
+    """Remove combining marks so accented chars compare as plain ASCII."""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s)
+        if unicodedata.category(c) != "Mn"
+    )
+
+
 
 class LrcLibFetcher:
     """
@@ -84,7 +104,7 @@ class LrcLibFetcher:
         try:
             r = session.get(f"{base_url}/get", params=params, timeout=timeout)
             if r.status_code == 200:
-                return LrcLibFetcher._parse_response(r.json())
+                return LrcLibFetcher._parse_response(_safe_json(r))
         except Exception:
             pass
         finally:
@@ -143,21 +163,33 @@ class LrcLibFetcher:
             return None
 
         try:
-            return r.json()
-        except ValueError:
+            return _safe_json(r)
+        except (ValueError, UnicodeDecodeError):
             return None
 
     def _search(self, title: str, artist: str, duration_s: int = 0) -> Optional[LyricsResult]:
         """Use the lrclib search endpoint as a second attempt."""
+        result = self._search_with_query(f"{artist} {title}", title, artist, duration_s)
+        if result is not None:
+            return result
+        # Fallback: try again with accents stripped (handles NFC/NFD mismatches).
+        plain_artist = _strip_accents(artist)
+        plain_title  = _strip_accents(title)
+        if plain_artist != artist or plain_title != title:
+            result = self._search_with_query(f"{plain_artist} {plain_title}", title, artist, duration_s)
+        return result
+
+    def _search_with_query(self, query: str, title: str, artist: str, duration_s: int) -> Optional[LyricsResult]:
+        """Run one lrclib /search query and rank results."""
         try:
             r = self._session.get(
                 f"{self.BASE_URL}/search",
-                params={"q": f"{artist} {title}"},
+                params={"q": query},
                 timeout=self.TIMEOUT,
             )
             r.raise_for_status()
-            results = r.json()
-        except (requests.RequestException, ValueError):
+            results = _safe_json(r)
+        except (requests.RequestException, ValueError, UnicodeDecodeError):
             return None
 
         if not isinstance(results, list) or not results:
@@ -187,10 +219,12 @@ class LrcLibFetcher:
 
     @staticmethod
     def _score_candidate(item: dict, title: str, artist: str, duration_s: int) -> float:
-        track_name = str(item.get("trackName") or item.get("track_name") or "")
-        artist_name = str(item.get("artistName") or item.get("artist_name") or "")
-        title_sim = SequenceMatcher(None, title.lower(), track_name.lower()).ratio()
-        artist_sim = SequenceMatcher(None, artist.lower(), artist_name.lower()).ratio()
+        track_name = _strip_accents(str(item.get("trackName") or item.get("track_name") or ""))
+        artist_name = _strip_accents(str(item.get("artistName") or item.get("artist_name") or ""))
+        title_cmp  = _strip_accents(_normalize_str(title))
+        artist_cmp = _strip_accents(_normalize_str(artist))
+        title_sim  = SequenceMatcher(None, title_cmp,  track_name.lower()).ratio()
+        artist_sim = SequenceMatcher(None, artist_cmp, artist_name.lower()).ratio()
 
         duration_sim = 0.0
         cand_duration = item.get("duration")

@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json as _json
 import logging
 import time as _time
 from dataclasses import dataclass
@@ -120,8 +121,8 @@ class AudDRecognizer:
             ) from exc
 
         try:
-            return resp.json()
-        except ValueError:
+            return _json.loads(resp.content.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
             raise RecognitionError("Resposta inesperada do AudD (não é JSON).")
 
     @staticmethod
@@ -301,8 +302,8 @@ class ACRCloudRecognizer:
             raise RecognitionError(f"Erro HTTP {exc.response.status_code} do ACRCloud.") from exc
 
         try:
-            payload = resp.json()
-        except ValueError:
+            payload = _json.loads(resp.content.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
             raise RecognitionError("Resposta inesperada do ACRCloud (não é JSON).")
 
         song = self._parse(payload)

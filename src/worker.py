@@ -173,8 +173,9 @@ class RecognitionWorker(QThread):
 
         # ── 3. Lyrics (only when the song changes) ───────────────────────────
         if song_key == self._current_song_key:
-            # Same song — UI is already advancing from the locked timecode anchor.
-            # No need to re-emit timecode; just confirm the song is still playing.
+            # Same song — refresh the timecode anchor so the UI stays in sync
+            # and the timer chain can restart if it died (e.g. end of song).
+            self.timecode_updated.emit(song.timecode_ms, cst)
             return
 
         self._current_song_key = song_key

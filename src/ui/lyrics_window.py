@@ -413,8 +413,9 @@ class LyricsWindow(QWidget):
 
         self._load_labels(lines)
 
-        if synced:
-            self._schedule_next_tick()
+        # Do NOT start the timer here — _on_timecode_updated fires immediately
+        # after this signal and carries the correct timecode.  The tick is
+        # started there so elapsed_ms() is accurate from the very first tick.
 
     @pyqtSlot()
     def _on_lyrics_not_found(self) -> None:
@@ -427,6 +428,22 @@ class LyricsWindow(QWidget):
 
     @pyqtSlot(int, float)
     def _on_timecode_updated(self, timecode_ms: int, capture_start: float) -> None:
+        # Compute what we'd expect the song position to be right now based on
+        # the NEW anchor from the API.
+        new_expected = timecode_ms + (time.perf_counter() - capture_start) * 1000
+
+        if self._capture_start > 0:
+            # Compare against where our current local clock says we are.
+            current_expected = self._timecode_ms + (time.perf_counter() - self._capture_start) * 1000
+            drift_ms = abs(new_expected - current_expected)
+            if drift_ms < 2000:
+                # Drift is small — keep existing anchor to avoid visible jumps.
+                # Still tick once to ensure the timer chain is alive.
+                if self._is_synced and self._lrc_lines:
+                    self._tick()
+                return
+
+        # First anchor or significant drift (≥2s) — accept the new anchor.
         self._timecode_ms   = timecode_ms
         self._capture_start = capture_start
         if self._is_synced and self._lrc_lines:
