@@ -8,10 +8,10 @@ import 'screens/home_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  
+
   // Configurar janela
   await windowManager.ensureInitialized();
-  
+
   WindowOptions windowOptions = const WindowOptions(
     size: Size(400, 800),
     center: false,
@@ -20,7 +20,7 @@ void main() async {
     titleBarStyle: TitleBarStyle.hidden,
     windowButtonVisibility: false,
   );
-  
+
   windowManager.waitUntilReadyToShow(windowOptions, () async {
     await windowManager.setAsFrameless();
     await windowManager.setAlwaysOnTop(true);
@@ -29,7 +29,7 @@ void main() async {
   });
 
   runApp(const FloatingLyricsApp());
-  
+
   // Configurar bitsdojo_window para drag
   doWhenWindowReady(() {
     final win = appWindow;

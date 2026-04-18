@@ -163,14 +163,19 @@ class WebSocketServer:
             "data": {}
         })
 
-    async def emit_lyrics_ready(self, lyrics: str, synced: bool) -> None:
+    async def emit_lyrics_ready(self, lyrics: str, synced: bool, capture_start_time: float | None = None, offset_ms: int = 0) -> None:
         """Emite evento de letras prontas."""
+        data = {
+            "lyrics": lyrics,
+            "synced": synced,
+            "offset_ms": offset_ms  # Offset de sincronização (pode ser negativo)
+        }
+        if capture_start_time is not None:
+            data["capture_start_time"] = capture_start_time
+        
         await self.broadcast({
             "type": "lyrics_ready",
-            "data": {
-                "lyrics": lyrics,
-                "synced": synced
-            }
+            "data": data
         })
 
     async def emit_lyrics_not_found(self) -> None:
@@ -180,11 +185,18 @@ class WebSocketServer:
             "data": {}
         })
 
-    async def emit_timecode_update(self, timecode_ms: int) -> None:
+    async def emit_timecode_update(self, timecode_ms: int, capture_start_time: float | None = None, offset_ms: int = 0) -> None:
         """Emite atualização de timecode para sincronização."""
+        data = {
+            "timecode_ms": timecode_ms,
+            "offset_ms": offset_ms  # Offset de sincronização
+        }
+        if capture_start_time is not None:
+            data["capture_start_time"] = capture_start_time
+        
         await self.broadcast({
             "type": "timecode_updated",
-            "data": {"timecode_ms": timecode_ms}
+            "data": data
         })
 
     async def emit_error(self, error: str) -> None:

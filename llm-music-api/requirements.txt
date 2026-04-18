@@ -1,0 +1,13 @@
+# Inferência de modelo LLM
+transformers>=4.38.0
+torch>=2.2.0
+accelerate>=0.27.0
+peft>=0.9.0
+bitsandbytes>=0.42.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0
+
+# Servidor Python (opcional, caso opte por microserviço separado)
+fastapi>=0.109.0
+uvicorn>=0.27.0
+pydantic>=2.6.0

@@ -23,10 +23,11 @@ class WebSocketBridgeHeadless:
     usamos asyncio.run_coroutine_threadsafe para comunicação thread-safe.
     """
 
-    def __init__(self, worker, event_loop: asyncio.AbstractEventLoop):
+    def __init__(self, worker, event_loop: asyncio.AbstractEventLoop, config):
         self._worker = worker
         self._loop = event_loop
         self._server = get_server()
+        self._config = config
         self._setup_callbacks()
 
     def _setup_callbacks(self) -> None:
@@ -87,7 +88,8 @@ class WebSocketBridgeHeadless:
     def on_lyrics_ready(self, lyrics: str, synced: bool, capture_start: float) -> None:
         """Handler para lyrics_ready."""
         _LOG.info(f"WS Bridge: lyrics_ready (synced={synced})")
-        self._schedule_coro(self._server.emit_lyrics_ready(lyrics, synced))
+        # NÃO adicionar offset manual - timecode vem compensado automaticamente
+        self._schedule_coro(self._server.emit_lyrics_ready(lyrics, synced, capture_start, offset_ms=0))
 
     def on_lyrics_not_found(self) -> None:
         """Handler para lyrics_not_found."""
@@ -96,7 +98,8 @@ class WebSocketBridgeHeadless:
 
     def on_timecode_updated(self, timecode_ms: int, capture_start: float) -> None:
         """Handler para timecode_updated."""
-        self._schedule_coro(self._server.emit_timecode_update(timecode_ms))
+        # NÃO adicionar offset manual - o timecode já vem compensado automaticamente
+        self._schedule_coro(self._server.emit_timecode_update(timecode_ms, capture_start, offset_ms=0))
 
     def on_error_occurred(self, error: str) -> None:
         """Handler para error_occurred."""

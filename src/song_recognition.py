@@ -24,11 +24,16 @@ import json as _json
 import logging
 import time as _time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
 
 import requests
 
 _LOG = logging.getLogger(__name__)
+
+# Diretório de cache para persistência
+_CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
+_RATE_LIMIT_CACHE_FILE = _CACHE_DIR / "rate_limits.json"
 
 
 class RecognitionError(Exception):
@@ -37,6 +42,16 @@ class RecognitionError(Exception):
 
 class RateLimitError(RecognitionError):
     """Raised when the recognition API reports a rate-limit / quota error."""
+    
+    def __init__(self, message: str, seconds_left: int = 86400):
+        """Inicializa erro de rate-limit com tempo de suspensão.
+        
+        Args:
+            message: Mensagem de erro
+            seconds_left: Segundos até reativação (padrão: 1 dia)
+        """
+        super().__init__(message)
+        self.seconds_left = seconds_left
 
 
 @dataclass
@@ -55,8 +70,8 @@ class AudDRecognizer:
     """Identifies songs by sending WAV audio to the AudD API."""
 
     BASE_URL = "https://api.audd.io/"
-    TIMEOUT_S = 10  # Reduzido de 30s para failover rápido
-    CONNECT_TIMEOUT_S = 5
+    TIMEOUT_S = 5  # Reduzido para evitar bloqueios longos
+    CONNECT_TIMEOUT_S = 3
 
     def __init__(self, api_key: str = "") -> None:
         self.api_key = api_key.strip()
@@ -215,9 +230,21 @@ class AudDRecognizer:
             code = err.get("error_code", 0)
             msg = err.get("error_message", "Erro desconhecido")
             if code in (901, 902):
+                # Tentar extrair tempo de espera da resposta da API
+                # AudD pode retornar 'seconds_left' ou similar
+                seconds_left = err.get("seconds_left") or err.get("retry_after")
+                if seconds_left is None:
+                    # Se não retornou, usar 1 dia (86400s) como padrão
+                    seconds_left = 86400
+                else:
+                    try:
+                        seconds_left = int(seconds_left)
+                    except (TypeError, ValueError):
+                        seconds_left = 86400
+                
                 raise RateLimitError(
-                    f"Limite da API AudD atingido (erro {code})."
-                    " Tentativas pausadas por 30 minutos."
+                    f"Limite da API AudD atingido (erro {code}). {msg}",
+                    seconds_left=seconds_left
                 )
             raise RecognitionError(f"AudD retornou erro {code}: {msg}")
 
@@ -256,8 +283,8 @@ class ACRCloudRecognizer:
       host           — e.g. identify-eu-west-1.acrcloud.com
     """
 
-    TIMEOUT_S = 10  # Reduzido de 30s para failover rápido
-    CONNECT_TIMEOUT_S = 5
+    TIMEOUT_S = 5  # Reduzido para evitar bloqueios longos
+    CONNECT_TIMEOUT_S = 3
 
     def __init__(self, access_key: str = "", access_secret: str = "", host: str = "") -> None:
         self.access_key    = access_key.strip()
@@ -358,10 +385,29 @@ class ACRCloudRecognizer:
     def _parse(payload: dict) -> Optional[SongInfo]:
         status = payload.get("status", {})
         code   = status.get("code", -1)
+        msg    = status.get("msg", "Erro desconhecido")
+        
         if code == 1001:
             return None
+        
+        # Código 3001 = rate limit excedido no ACRCloud
+        if code == 3001:
+            # ACRCloud pode retornar tempo de espera em 'retry_after' ou similar
+            retry_after = payload.get("retry_after") or status.get("retry_after")
+            if retry_after is None:
+                retry_after = 86400  # 1 dia padrão
+            else:
+                try:
+                    retry_after = int(retry_after)
+                except (TypeError, ValueError):
+                    retry_after = 86400
+            
+            raise RateLimitError(
+                f"Limite da API ACRCloud atingido (erro {code}). {msg}",
+                seconds_left=retry_after
+            )
+        
         if code != 0:
-            msg = status.get("msg", "Erro desconhecido")
             raise RecognitionError(f"ACRCloud erro {code}: {msg}")
 
         music_list = (payload.get("metadata") or {}).get("music") or []
@@ -415,6 +461,10 @@ class MultiProviderRecognizer:
         self._order = self._parse_order(order)
         self._attempts_per_provider = max(1, int(attempts_per_provider or 2))
         self._fresh_capture_callback = None  # Callback para capturar áudio fresco
+        self._suspended_until: dict[str, float] = {}  # {provider_name: timestamp}
+        
+        # Carregar suspensões persistidas de sessões anteriores
+        self._load_suspensions()
 
     @staticmethod
     def _parse_order(order: str) -> list[str]:
@@ -438,6 +488,122 @@ class MultiProviderRecognizer:
         Se None, usa o mesmo áudio para todas as tentativas (comportamento antigo).
         """
         self._fresh_capture_callback = callback
+
+    def _load_suspensions(self) -> None:
+        """Carrega suspensões persistidas do arquivo de cache."""
+        if not _RATE_LIMIT_CACHE_FILE.exists():
+            return
+        
+        try:
+            with open(_RATE_LIMIT_CACHE_FILE, 'r', encoding='utf-8') as f:
+                data = _json.load(f)
+            
+            now = _time.time()
+            loaded_count = 0
+            
+            for provider_name, resume_time in data.items():
+                # Carregar apenas suspensões ainda válidas
+                if resume_time > now:
+                    self._suspended_until[provider_name] = float(resume_time)
+                    loaded_count += 1
+                    
+                    remaining = int(resume_time - now)
+                    hours_left = remaining // 3600
+                    _LOG.warning(
+                        f"💾 Suspensão de {provider_name} restaurada do cache "
+                        f"(faltam ~{hours_left}h de {remaining//86400}d)"
+                    )
+            
+            if loaded_count == 0:
+                # Todas expiraram, limpar arquivo
+                _RATE_LIMIT_CACHE_FILE.unlink(missing_ok=True)
+                _LOG.info("🧹 Cache de suspensões limpo (todas expiraram)")
+                
+        except Exception as exc:
+            _LOG.warning(f"Erro ao carregar suspensões do cache: {exc}")
+
+    def _save_suspensions(self) -> None:
+        """Salva suspensões atuais no arquivo de cache."""
+        try:
+            # Criar diretório se não existir
+            _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            
+            # Salvar apenas suspensões ainda válidas
+            now = _time.time()
+            valid_suspensions = {
+                provider: timestamp
+                for provider, timestamp in self._suspended_until.items()
+                if timestamp > now
+            }
+            
+            if valid_suspensions:
+                with open(_RATE_LIMIT_CACHE_FILE, 'w', encoding='utf-8') as f:
+                    _json.dump(valid_suspensions, f, indent=2)
+                _LOG.debug(f"💾 Suspensões salvas em cache: {list(valid_suspensions.keys())}")
+            else:
+                # Nenhuma suspensão válida, remover arquivo
+                _RATE_LIMIT_CACHE_FILE.unlink(missing_ok=True)
+                
+        except Exception as exc:
+            _LOG.warning(f"Erro ao salvar suspensões no cache: {exc}")
+
+    def is_provider_suspended(self, provider_name: str) -> bool:
+        """Verifica se um provedor está suspenso por rate-limit."""
+        if provider_name not in self._suspended_until:
+            return False
+        
+        if _time.time() < self._suspended_until[provider_name]:
+            return True
+        
+        # Suspensão expirou, remover e atualizar cache
+        del self._suspended_until[provider_name]
+        self._save_suspensions()  # Atualizar arquivo
+        _LOG.info(f"✅ Provedor {provider_name} reativado após suspensão por rate-limit")
+        return False
+
+    def suspend_provider(self, provider_name: str, duration_seconds: int = 86400) -> None:
+        """Suspende provedor por X segundos (padrão: 1 dia = 86400s)."""
+        resume_time = _time.time() + duration_seconds
+        self._suspended_until[provider_name] = resume_time
+        
+        # Salvar em cache para persistência
+        self._save_suspensions()
+        
+        # Formatar mensagem com duração legível
+        hours = duration_seconds // 3600
+        if hours >= 24:
+            days = hours // 24
+            duration_msg = f"{days} dia(s)"
+        else:
+            duration_msg = f"{hours} hora(s)"
+        
+        _LOG.warning(
+            f"🚫 Provedor {provider_name} SUSPENSO por {duration_msg} devido a rate-limit. "
+            f"Reativação: {_time.strftime('%Y-%m-%d %H:%M:%S', _time.localtime(resume_time))}"
+        )
+
+    def clear_all_suspensions(self) -> None:
+        """Limpa todas as suspensões (útil para reset manual)."""
+        count = len(self._suspended_until)
+        self._suspended_until.clear()
+        self._save_suspensions()
+        _LOG.info(f"🗑️ Todas as suspensões foram removidas ({count} provedores)")
+
+    def get_suspension_status(self) -> dict[str, dict]:
+        """Retorna status de suspensões para diagnóstico."""
+        now = _time.time()
+        status = {}
+        
+        for provider, resume_time in self._suspended_until.items():
+            remaining = max(0, int(resume_time - now))
+            status[provider] = {
+                "suspended": resume_time > now,
+                "resume_time": _time.strftime('%Y-%m-%d %H:%M:%S', _time.localtime(resume_time)),
+                "remaining_hours": remaining // 3600,
+                "remaining_seconds": remaining
+            }
+        
+        return status
 
     def update_credentials(
         self,
@@ -512,6 +678,17 @@ class MultiProviderRecognizer:
         ]
 
         for slot, (provider_attempt, provider_name) in enumerate(attempt_plan, start=1):
+            # Verificar se provedor está suspenso por rate-limit anterior
+            if self.is_provider_suspended(provider_name):
+                remaining = int(self._suspended_until[provider_name] - _time.time())
+                hours_left = remaining // 3600
+                _LOG.debug(
+                    "⏸️  Pulando %s - suspenso por rate-limit (faltam ~%d horas)",
+                    provider_name,
+                    hours_left,
+                )
+                continue
+            
             if provider_name in rate_limited_providers:
                 _LOG.debug(
                     "Pulando %s por rate-limit já detectado (rodada %d/%d)",
@@ -596,6 +773,16 @@ class MultiProviderRecognizer:
             rate_limited_providers.add(provider_name)
             if isinstance(err, RateLimitError):
                 last_rate_limit = err
+            
+            # Suspender provedor usando tempo retornado pela API (ou 1 dia padrão)
+            duration = err.seconds_left if isinstance(err, RateLimitError) else 86400
+            
+            # Log se usamos tempo da API ou padrão
+            if isinstance(err, RateLimitError) and err.seconds_left != 86400:
+                _LOG.info(f"⏱️  API retornou tempo de espera: {duration}s (~{duration//3600}h)")
+            
+            self.suspend_provider(provider_name, duration_seconds=duration)
+            
             if len(rate_limited_providers) == providers_count:
                 _LOG.warning("Todos os provedores foram rate-limited nesta sequência")
             return False, song, cst, last_rate_limit, last_error, had_clean_miss
@@ -607,6 +794,16 @@ class MultiProviderRecognizer:
     def recognize(
         self, audio_bytes: bytes, capture_start_time: float
     ) -> Tuple[Optional[SongInfo], float]:
+        # Verificar e informar provedores suspensos
+        suspended = [p for p in self._order if self.is_provider_suspended(p)]
+        if suspended:
+            for provider in suspended:
+                remaining = int(self._suspended_until[provider] - _time.time())
+                hours_left = remaining // 3600
+                _LOG.warning(
+                    f"⏸️  Provedor {provider} está SUSPENSO (faltam ~{hours_left}h de {remaining//86400}d)"
+                )
+        
         _LOG.info(
             "Fallback de reconhecimento iniciado | ordem=%s | tentativas_por_provedor=%d",
             " -> ".join(self._order),

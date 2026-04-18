@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Callable, Any
 
 from src.song_recognition import RateLimitError
@@ -65,6 +66,20 @@ class RecognitionWorkerHeadless(threading.Thread):
         self._spectrum_thread: threading.Thread | None = None
         self._spectrum_running = False
         
+        # ThreadPool para busca de letras não bloqueante
+        self._lyrics_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LyricsFetch")
+        self._pending_lyrics_future: Future | None = None
+        
+        # Detecção de silêncio para forçar redetecção
+        self._low_spectrum_count = 0  # Contador de frames com espectro baixo
+        # Configurar via config.ini ou usar padrões
+        self._silence_frames_threshold = self._config.getint(
+            "Recognition", "silence_frames_threshold", fallback=60
+        )  # ~3s de silêncio (60 frames * 50ms)
+        self._low_spectrum_max = self._config.getfloat(
+            "Recognition", "silence_spectrum_threshold", fallback=0.05
+        )  # Threshold: max 5% de energia normalizada
+        
         # Configurar callback de captura fresca no recognizer
         self._recognizer.set_fresh_capture_callback(self._capture_fresh_audio)
 
@@ -89,6 +104,11 @@ class RecognitionWorkerHeadless(threading.Thread):
         """Para a thread."""
         self._spectrum_running = False
         self._stop_flag.set()
+        
+        # Cancelar busca de letras pendente e aguardar shutdown
+        if self._pending_lyrics_future and not self._pending_lyrics_future.done():
+            self._pending_lyrics_future.cancel()
+        self._lyrics_executor.shutdown(wait=False, cancel_futures=True)
 
     def join(self, timeout=None) -> None:
         """Aguarda a thread terminar."""
@@ -126,7 +146,6 @@ class RecognitionWorkerHeadless(threading.Thread):
         _LOG.info("🎵 Thread de captura de espectro iniciada")
         error_count = 0
         max_errors = 10
-        success_count = 0
         first_call = True
         
         while self._spectrum_running:
@@ -139,24 +158,58 @@ class RecognitionWorkerHeadless(threading.Thread):
                 spectrum = self._audio.capture_spectrum(duration_ms=100, num_bars=32)
                 self._emit('audio_spectrum', spectrum)
                 error_count = 0  # Reset contador de erros em caso de sucesso
-                success_count += 1
                 
-                # Log a cada 200 capturas bem-sucedidas (~10 segundos)
-                if success_count % 200 == 0:
-                    _LOG.info(f"✅ Espectro capturado: {success_count} capturas bem-sucedidas")
+                # Detectar silêncio prolongado
+                self._check_silence_and_reset(spectrum)
                     
             except Exception as exc:
                 error_count += 1
                 if error_count <= 3:  # Logar apenas primeiros 3 erros
                     _LOG.warning(f"Erro ao capturar espectro ({error_count}/{max_errors}): {exc}")
                 elif error_count == max_errors:
-                    _LOG.error(f"Muitos erros consecutivos ao capturar espectro. Parando thread.")
+                    _LOG.error("Muitos erros consecutivos ao capturar espectro. Parando thread.")
                     break
             
             # Atualizar ~20 vezes por segundo (50ms de sleep)
             time.sleep(0.05)
         
         _LOG.info("Thread de espectro parada")
+
+    def _check_silence_and_reset(self, spectrum: list[float]) -> None:
+        """Detecta silêncio prolongado e força redetecção se necessário."""
+        # Ignorar se não há música tocando atualmente
+        if self._current_song_key is None:
+            self._low_spectrum_count = 0
+            return
+        
+        # Calcular energia média do espectro (normalizado 0-1)
+        avg_energy = sum(spectrum) / len(spectrum) if spectrum else 0.0
+        
+        # Checar se está abaixo do threshold de silêncio
+        if avg_energy < self._low_spectrum_max:
+            self._low_spectrum_count += 1
+            
+            # Se atingiu threshold de silêncio, resetar música e forçar redetecção
+            if self._low_spectrum_count >= self._silence_frames_threshold:
+                _LOG.info(
+                    f"🔇 Silêncio detectado por {self._low_spectrum_count} frames (~{self._low_spectrum_count * 0.05:.1f}s). "
+                    f"Resetando música atual e forçando redetecção."
+                )
+                
+                # Resetar estado da música
+                self._current_song_key = None
+                self._current_song_duration_s = 0.0
+                self._miss_streak = 0
+                self._low_spectrum_count = 0
+                
+                # Emitir evento de música não encontrada para limpar UI
+                self._emit('song_not_found')
+                
+                _LOG.debug("Estado resetado. Próximo ciclo tentará detectar nova música.")
+        else:
+            # Resetar contador se voltou a ter áudio
+            if self._low_spectrum_count > 0:
+                self._low_spectrum_count = 0
 
     # ── Private helpers ─────────────────────────────────────────────────────
 
@@ -276,7 +329,17 @@ class RecognitionWorkerHeadless(threading.Thread):
         if song_key == self._current_song_key:
             # Same song, just update timecode
             if result.timecode_ms is not None and result.timecode_ms > 0:
-                self._emit('timecode_updated', result.timecode_ms, capture_start)
+                # 🔧 COMPENSAÇÃO AUTOMÁTICA DE LATÊNCIA:
+                # Adiciona o tempo decorrido desde a captura para compensar
+                # o delay de: tempo de captura + processamento API + network
+                elapsed_ms = int((time.perf_counter() - capture_start) * 1000)
+                compensated_timecode = result.timecode_ms + elapsed_ms
+                
+                _LOG.debug(
+                    f"🎵 Timecode compensado: {result.timecode_ms}ms + {elapsed_ms}ms delay = {compensated_timecode}ms"
+                )
+                
+                self._emit('timecode_updated', compensated_timecode, capture_start)
             self._miss_streak = 0
             return
         
@@ -289,7 +352,7 @@ class RecognitionWorkerHeadless(threading.Thread):
         self._handle_lyrics_for_song(song_key, result, capture_start)
 
     def _handle_lyrics_for_song(self, song_key, result, capture_start: float) -> None:
-        """Busca e emite letras para a música."""
+        """Busca e emite letras para a música (de forma assíncrona)."""
         # Check cache
         if song_key in self._lyrics_cache:
             cached = self._lyrics_cache[song_key]
@@ -301,13 +364,41 @@ class RecognitionWorkerHeadless(threading.Thread):
             
             # Update timecode anyway
             if result.timecode_ms is not None and result.timecode_ms > 0:
-                self._emit('timecode_updated', result.timecode_ms, capture_start)
+                # 🔧 COMPENSAÇÃO AUTOMÁTICA DE LATÊNCIA
+                elapsed_ms = int((time.perf_counter() - capture_start) * 1000)
+                compensated_timecode = result.timecode_ms + elapsed_ms
+                
+                _LOG.debug(
+                    f"🎵 Timecode inicial compensado: {result.timecode_ms}ms + {elapsed_ms}ms = {compensated_timecode}ms"
+                )
+                
+                self._emit('timecode_updated', compensated_timecode, capture_start)
             return
         
-        # Fetch lyrics
+        # Cancelar busca anterior se ainda estiver rodando
+        if self._pending_lyrics_future and not self._pending_lyrics_future.done():
+            _LOG.debug("Cancelando busca de letras anterior que ainda estava rodando")
+            self._pending_lyrics_future.cancel()
+        
+        # Fetch lyrics em thread separada (NÃO BLOQUEIA)
         self._emit('status_changed', "📝 Buscando letras...")
         self._emit('lyrics_loading')
         
+        # Submeter busca para ThreadPool
+        self._pending_lyrics_future = self._lyrics_executor.submit(
+            self._fetch_lyrics_async,
+            song_key,
+            result,
+            capture_start
+        )
+        
+        # Callback quando completar (não bloqueia)
+        self._pending_lyrics_future.add_done_callback(
+            lambda f: self._on_lyrics_fetched(f, song_key, result, capture_start)
+        )
+
+    def _fetch_lyrics_async(self, song_key, result, capture_start: float) -> tuple:
+        """Busca letras (roda em thread separada)."""
         try:
             lyrics_result = self._lyrics.fetch(
                 title=result.title,
@@ -315,8 +406,26 @@ class RecognitionWorkerHeadless(threading.Thread):
                 album=result.album,
                 duration_s=result.duration_s,
             )
+            return (lyrics_result, None)
+        except Exception as exc:
+            return (None, exc)
+
+    def _on_lyrics_fetched(self, future: Future, song_key, result, capture_start: float) -> None:
+        """Callback quando busca de letras completa."""
+        if future.cancelled():
+            _LOG.debug("Busca de letras foi cancelada")
+            return
+        
+        try:
+            lyrics_result, error = future.result(timeout=0.1)
             
-            if lyrics_result.lines:
+            if error:
+                _LOG.error(f"Erro ao buscar letras: {error}", exc_info=True)
+                self._lyrics_cache[song_key] = None
+                self._emit('lyrics_not_found')
+                return
+            
+            if lyrics_result and lyrics_result.lines:
                 # Converter para formato de texto
                 if lyrics_result.synced and lyrics_result.raw_lrc:
                     lyrics_text = lyrics_result.raw_lrc
@@ -332,9 +441,8 @@ class RecognitionWorkerHeadless(threading.Thread):
             else:
                 self._lyrics_cache[song_key] = None
                 self._emit('lyrics_not_found')
-                
         except Exception as exc:
-            _LOG.error(f"Erro ao buscar letras: {exc}", exc_info=True)
+            _LOG.error(f"Erro ao processar resultado de busca de letras: {exc}", exc_info=True)
             self._lyrics_cache[song_key] = None
             self._emit('lyrics_not_found')
 

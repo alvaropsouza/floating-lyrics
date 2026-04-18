@@ -28,6 +28,10 @@ Thumbs.db
 
 # Runtime and local secrets
 .env
+
+# Cache e rate-limit persistence
+cache/
+rate_limits.json
 .env.*
 *.local
 *.local.*

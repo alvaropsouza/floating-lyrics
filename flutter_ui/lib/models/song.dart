@@ -41,7 +41,7 @@ class LyricsData {
         cleanContent = parts[1].trim();
       }
     }
-    
+
     if (!synced) {
       // Letras não sincronizadas: cada linha sem timestamp
       return cleanContent
@@ -63,7 +63,8 @@ class LyricsData {
         final centiseconds = int.parse(match.group(3)!);
         final text = match.group(4)!.trim();
 
-        final timeMs = (minutes * 60 * 1000) + (seconds * 1000) + (centiseconds * 10);
+        final timeMs =
+            (minutes * 60 * 1000) + (seconds * 1000) + (centiseconds * 10);
 
         if (text.isNotEmpty) {
           lines.add(LyricLine(text: text, timeMs: timeMs));

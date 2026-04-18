@@ -45,13 +45,19 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
       return;
     }
 
-    final timecodeMs = ws.timecodeMs;
+    // Usar posição calculada em tempo real ao invés de timecodeMs estático
+    final currentPositionMs = ws.currentPositionMs;
 
-    // Encontrar linha atual baseada no timecode
+    // Debug ocasional
+    if (_currentLineIndex == 0 && currentPositionMs > 1000) {
+      debugPrint('📍 Posição atual: ${currentPositionMs}ms (${(currentPositionMs / 1000).toStringAsFixed(1)}s)');
+    }
+
+    // Encontrar linha atual baseada na posição calculada
     int newIndex = 0;
     for (int i = 0; i < lyrics.lines.length; i++) {
       final lineTime = lyrics.lines[i].timeMs;
-      if (lineTime != null && lineTime <= timecodeMs) {
+      if (lineTime != null && lineTime <= currentPositionMs) {
         newIndex = i;
       } else {
         break;

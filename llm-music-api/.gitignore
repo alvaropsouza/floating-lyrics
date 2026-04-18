@@ -1,0 +1,12 @@
+node_modules/
+.env
+*.log
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+models/
+!models/.gitkeep
+.vscode/
+.idea/

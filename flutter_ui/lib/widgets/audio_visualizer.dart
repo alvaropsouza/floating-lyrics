@@ -8,7 +8,7 @@ class AudioVisualizer extends StatefulWidget {
   final bool isPlaying;
   final Color barColor;
   final int barCount;
-  
+
   const AudioVisualizer({
     super.key,
     this.isPlaying = false,
@@ -31,9 +31,9 @@ class _AudioVisualizerState extends State<AudioVisualizer> {
 
   void _updateSpectrum(List<double> spectrum) {
     // Verificar se há dados de espectro válidos (não todos zeros ou ruído)
-    final hasValidSpectrum = spectrum.isNotEmpty && 
-                             spectrum.any((v) => v > 0.1); // Threshold maior para ignorar ruído
-    
+    final hasValidSpectrum = spectrum.isNotEmpty &&
+        spectrum.any((v) => v > 0.1); // Threshold maior para ignorar ruído
+
     if (hasValidSpectrum) {
       // Usar dados reais do backend
       _barHeights = List.from(spectrum);
@@ -52,7 +52,7 @@ class _AudioVisualizerState extends State<AudioVisualizer> {
       builder: (context, wsService, child) {
         // Atualizar espectro a cada rebuild (quando service notifica)
         _updateSpectrum(wsService.audioSpectrum);
-        
+
         return Container(
           height: 120,
           decoration: BoxDecoration(
@@ -89,7 +89,7 @@ class _AudioVisualizerState extends State<AudioVisualizer> {
   Widget _buildBar(int index) {
     final height = _barHeights[index];
     final maxHeight = 100.0;
-    
+
     return AnimatedContainer(
       duration: const Duration(milliseconds: 100),
       curve: Curves.easeOut,
@@ -121,7 +121,7 @@ class _AudioVisualizerState extends State<AudioVisualizer> {
 class WaveVisualizer extends StatefulWidget {
   final bool isPlaying;
   final Color waveColor;
-  
+
   const WaveVisualizer({
     super.key,
     this.isPlaying = false,
@@ -142,16 +142,16 @@ class _WaveVisualizerState extends State<WaveVisualizer>
   void initState() {
     super.initState();
     _initWavePoints();
-    
+
     _controller = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 50),
     )..addListener(() {
-      if (widget.isPlaying) {
-        _updateWave();
-      }
-    });
-    
+        if (widget.isPlaying) {
+          _updateWave();
+        }
+      });
+
     _controller.repeat();
   }
 
@@ -166,7 +166,7 @@ class _WaveVisualizerState extends State<WaveVisualizer>
     setState(() {
       // Shift wave left
       _wavePoints.removeAt(0);
-      
+
       if (widget.isPlaying) {
         // Add new random point
         _wavePoints.add(0.3 + _random.nextDouble() * 0.4);
@@ -225,7 +225,7 @@ class _WavePainter extends CustomPainter {
     for (int i = 0; i < points.length; i++) {
       final x = i * step;
       final y = size.height * points[i];
-      
+
       if (i == 0) {
         path.moveTo(x, y);
       } else {

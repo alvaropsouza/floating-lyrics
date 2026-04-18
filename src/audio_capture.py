@@ -7,6 +7,7 @@ loopback no Windows.  Instale com:  pip install pyaudiowpatch
 
 import io
 import logging
+import threading
 import wave
 from typing import Optional
 
@@ -46,6 +47,9 @@ class AudioCapture:
     def __init__(self, config) -> None:
         self._config = config
         self._pa: Optional[object] = None
+        self._lock = threading.RLock()  # Lock para evitar acesso simultâneo ao WASAPI
+        self._last_spectrum: list[float] = [0.0] * 32  # Cache do último espectro
+        self._spectrum_cache_hits = 0  # Contador de cache hits consecutivos
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
@@ -232,6 +236,37 @@ class AudioCapture:
         Returns:
             Lista de valores normalizados [0.0-1.0] representando amplitude por banda
         """
+        # NON-BLOCKING LOCK: Se não conseguir lock imediatamente (reconhecimento em andamento),
+        # retorna último espectro ao invés de bloquear. Isso mantém as barras fluidas.
+        acquired = self._lock.acquire(blocking=False)
+        
+        if not acquired:
+            # Lock ocupado (provavelmente pelo reconhecimento de música)
+            # Retornar cache do último espectro com decay suave
+            self._spectrum_cache_hits += 1
+            
+            # Aplicar decay gradual se ficar muito tempo sem captura nova
+            # Decay de ~5% por hit para suavizar descida
+            decay_factor = 0.95 if self._spectrum_cache_hits < 20 else 0.90
+            decayed = [v * decay_factor for v in self._last_spectrum]
+            self._last_spectrum = decayed
+            
+            return decayed.copy()
+        
+        try:
+            spectrum = self._capture_spectrum_unsafe(duration_ms, num_bars)
+            self._last_spectrum = spectrum.copy()  # Atualizar cache
+            
+            # Reset contador quando volta a capturar
+            if self._spectrum_cache_hits > 0:
+                self._spectrum_cache_hits = 0
+            
+            return spectrum
+        finally:
+            self._lock.release()
+    
+    def _capture_spectrum_unsafe(self, duration_ms: int = 100, num_bars: int = 32) -> list[float]:
+        """Versão sem lock - usada internamente após adquirir lock."""
         if self._pa is None:
             _LOG.debug("PyAudio not initialized, returning zeros")
             return [0.0] * num_bars
@@ -353,6 +388,12 @@ class AudioCapture:
             AudioCaptureError: if the capture device is unavailable, no
                 audio is detected (silence), or any other recording error.
         """
+        # Lock para evitar acesso simultâneo ao WASAPI
+        with self._lock:
+            return self._capture_unsafe(duration)
+    
+    def _capture_unsafe(self, duration: int) -> bytes:
+        """Versão sem lock - usada internamente após adquirir lock."""
         if self._pa is None:
             raise AudioCaptureError(
                 "AudioCapture não foi inicializado. Chame initialize() antes."

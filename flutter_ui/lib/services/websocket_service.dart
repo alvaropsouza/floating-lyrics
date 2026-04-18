@@ -7,15 +7,16 @@ import '../models/song.dart';
 
 class WebSocketService extends ChangeNotifier {
   static const String _wsUrl = 'ws://127.0.0.1:8765/ws';
-  
+
   WebSocketChannel? _channel;
   StreamSubscription? _subscription;
-  
+
   // Estado
   String _status = 'Conectando...';
   Song? _currentSong;
   LyricsData? _lyrics;
   int _timecodeMs = 0;
+  int? _localTimestamp;  // Timestamp local (ms) quando recebeu o timecode
   bool _isConnected = false;
   String? _error;
   List<double> _audioSpectrum = List.filled(32, 0.0);
@@ -29,19 +30,31 @@ class WebSocketService extends ChangeNotifier {
   bool get isConnected => _isConnected;
   String? get error => _error;
   List<double> get audioSpectrum => _audioSpectrum;
+  
+  /// Calcula posição atual da música em tempo real
+  int get currentPositionMs {
+    if (_localTimestamp == null) return _timecodeMs;
+    
+    // Tempo decorrido desde que recebemos o timecode (em ms)
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final elapsedMs = now - _localTimestamp!;
+    
+    // Posição = timecode inicial + tempo decorrido
+    return _timecodeMs + elapsedMs;
+  }
 
   void connect() {
     try {
       _channel = WebSocketChannel.connect(Uri.parse(_wsUrl));
       _isConnected = true;
       _error = null;
-      
+
       _subscription = _channel!.stream.listen(
         _handleMessage,
         onError: _handleError,
         onDone: _handleDisconnect,
       );
-      
+
       debugPrint('WebSocket conectado: $_wsUrl');
       notifyListeners();
     } catch (e) {
@@ -79,16 +92,26 @@ class WebSocketService extends ChangeNotifier {
         case 'song_found':
           _currentSong = Song.fromJson(payload ?? {});
           _status = 'Tocando: $_currentSong';
+          // Resetar timecode ao trocar de música
+          _timecodeMs = 0;
+          _localTimestamp = null;
           break;
 
         case 'song_not_found':
           _status = 'Música não reconhecida';
+          // Resetar sincronização
+          _timecodeMs = 0;
+          _localTimestamp = null;
           break;
 
         case 'lyrics_ready':
           final content = payload?['lyrics'] as String? ?? '';
           final synced = payload?['synced'] as bool? ?? false;
           _lyrics = LyricsData(content: content, synced: synced);
+          
+          // Não precisa mais do capture_start_time do servidor
+          // Vamos inicializar timestamp local quando receber timecode_updated
+          
           if (_lyrics!.lines.isEmpty) {
             debugPrint('⚠️ Letras vazias após parse (${content.length} chars)');
           }
@@ -101,6 +124,13 @@ class WebSocketService extends ChangeNotifier {
 
         case 'timecode_updated':
           _timecodeMs = payload?['timecode_ms'] as int? ?? 0;
+          // Armazenar timestamp LOCAL quando recebemos este evento
+          _localTimestamp = DateTime.now().millisecondsSinceEpoch;
+          
+          // Debug: Log apenas na primeira vez para verificar sincronização
+          if (_timecodeMs > 0) {
+            debugPrint('🎵 Timecode: ${_timecodeMs}ms (${(_timecodeMs / 1000).toStringAsFixed(1)}s)');
+          }
           break;
 
         case 'error':
@@ -111,7 +141,8 @@ class WebSocketService extends ChangeNotifier {
         case 'audio_spectrum':
           final spectrum = payload?['spectrum'] as List<dynamic>?;
           if (spectrum != null) {
-            _audioSpectrum = spectrum.map((e) => (e as num).toDouble()).toList();
+            _audioSpectrum =
+                spectrum.map((e) => (e as num).toDouble()).toList();
             // Throttle: notificar apenas a cada 50ms (20 FPS)
             final now = DateTime.now().millisecondsSinceEpoch;
             if (now - _lastSpectrumNotifyTime >= 50) {

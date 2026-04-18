@@ -70,7 +70,7 @@ class LrcLibFetcher:
     """
 
     BASE_URL = "https://lrclib.net/api"
-    TIMEOUT = 10
+    TIMEOUT = 5  # Reduzido para evitar bloqueios longos
 
     def __init__(self) -> None:
         self._session = requests.Session()

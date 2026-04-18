@@ -128,10 +128,10 @@ class HeadlessBackendServer:
             if alternative_port:
                 _LOG.info(f"✓ Porta {alternative_port} disponível, usando-a...")
                 # Recriar servidor com porta alternativa
-                from src.websocket_server import _server_instance, WebSocketServer
-                global _server_instance
-                _server_instance = WebSocketServer(host, alternative_port)
-                self.ws_server = _server_instance
+                from src.websocket_server import WebSocketServer
+                from src import websocket_server
+                websocket_server._server_instance = WebSocketServer(host, alternative_port)
+                self.ws_server = websocket_server._server_instance
             else:
                 _LOG.error("❌ Nenhuma porta disponível encontrada!")
                 _LOG.error("💡 Dica: Feche outros servidores Python rodando com:")
@@ -151,7 +151,7 @@ class HeadlessBackendServer:
         
         # Criar bridge (passa o event loop atual)
         self.loop = asyncio.get_running_loop()
-        self.bridge = WebSocketBridgeHeadless(self.worker, self.loop)
+        self.bridge = WebSocketBridgeHeadless(self.worker, self.loop, self.config)
         
         # Iniciar worker em thread separada
         _LOG.info("Iniciando reconhecimento de música...")
@@ -175,6 +175,7 @@ class HeadlessBackendServer:
         except asyncio.CancelledError:
             _LOG.info("\nShutdown solicitado...")
             await self.shutdown()
+            raise  # Re-raise para propagar corretamente o cancelamento
 
     async def shutdown(self) -> None:
         """Shutdown gracioso."""
