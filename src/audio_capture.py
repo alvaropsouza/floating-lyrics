@@ -221,6 +221,127 @@ class AudioCapture:
 
     # ── Capture ─────────────────────────────────────────────────────────────
 
+    def capture_spectrum(self, duration_ms: int = 100, num_bars: int = 32) -> list[float]:
+        """
+        Captura um snapshot rápido de áudio e retorna espectro de frequências.
+        
+        Args:
+            duration_ms: Duração da captura em milissegundos (padrão: 100ms)
+            num_bars: Número de barras de frequência desejadas
+            
+        Returns:
+            Lista de valores normalizados [0.0-1.0] representando amplitude por banda
+        """
+        if self._pa is None:
+            _LOG.debug("PyAudio not initialized, returning zeros")
+            return [0.0] * num_bars
+        
+        # TEMPORÁRIO: Abrir/fechar streams 20x/seg causa travamento
+        # Por enquanto, retornar dados baseados em captura única simplificada
+        try:
+            device = self._get_loopback_device()
+            sample_rate: int = int(device["defaultSampleRate"])
+            channels: int = min(int(device["maxInputChannels"]), 2) or 1
+            
+            chunk = 512  # Chunk menor para captura mais rápida
+            
+            # Abrir stream de forma mais tolerante a erros
+            stream = None
+            try:
+                stream = self._pa.open(
+                    format=pyaudio.paInt16,
+                    channels=channels,
+                    rate=sample_rate,
+                    input=True,
+                    input_device_index=int(device["index"]),
+                    frames_per_buffer=chunk,
+                )
+                
+                # Capturar apenas 2 chunks (~20ms) para ser bem rápido
+                frames = []
+                for _ in range(2):
+                    data = stream.read(chunk, exception_on_overflow=False)
+                    frames.append(data)
+
+                raw_audio = b"".join(frames)
+                
+            except Exception as stream_exc:
+                _LOG.debug(f"Failed to capture spectrum audio: {stream_exc}")
+                return [0.0] * num_bars
+            finally:
+                if stream is not None:
+                    try:
+                        stream.stop_stream()
+                        stream.close()
+                    except:
+                        pass
+            
+            # Calcular espectro usando FFT
+            if len(raw_audio) == 0:
+                return [0.0] * num_bars
+                
+            # Calcular FFT
+            if _NUMPY_AVAILABLE:
+                samples = _np.frombuffer(raw_audio, dtype="<i2").astype(_np.float32)
+                
+                # Se stereo, pegar apenas um canal
+                if channels > 1:
+                    samples = samples[::channels]
+                
+                # Aplicar FFT
+                fft_data = _np.abs(_np.fft.rfft(samples))
+                
+                # Limitar espectro FFT para frequências musicais (até ~16kHz)
+                # Acima disso há pouca/nenhuma energia em música comum
+                # Usar apenas os primeiros 66% dos bins FFT (~16kHz de 24kHz)
+                spectrum_size = int(len(fft_data) * 0.66)
+                fft_data = fft_data[:spectrum_size]
+                
+                bars = []
+                
+                for i in range(num_bars):
+                    # Mapeamento logarítmico bem suave (expoente 1.3)
+                    # Distribui: graves (esquerda), médios (centro), agudos (direita)
+                    start_idx = int((i / num_bars) ** 1.3 * spectrum_size)
+                    end_idx = int(((i + 1) / num_bars) ** 1.3 * spectrum_size)
+                    end_idx = max(start_idx + 1, end_idx)
+                    
+                    # Média da banda
+                    band_avg = float(_np.mean(fft_data[start_idx:end_idx]))
+                    
+                    # Boost progressivo para frequências altas (elas têm menos energia naturalmente)
+                    # Últimas 30% das barras recebem boost crescente
+                    if i > num_bars * 0.7:
+                        boost = 1.0 + (i - num_bars * 0.7) / (num_bars * 0.3) * 2.0  # até 3x
+                        band_avg *= boost
+                    
+                    bars.append(band_avg)
+                
+                # Verificar nível geral de áudio ANTES de normalizar
+                max_raw = max(bars) if bars else 0.0
+                
+                # Se o nível geral é muito baixo, retornar zeros (sem áudio/apenas ruído)
+                if max_raw < 1000:  # Threshold absoluto para ruído de fundo
+                    return [0.0] * num_bars
+                
+                # Normalizar para [0.0, 1.0]
+                if bars and max_raw > 0:
+                    bars = [min(1.0, b / max_raw * 1.5) for b in bars]  # 1.5x para dar dinâmica
+                    
+                    # Noise gate reduzido para permitir agudos mais baixos
+                    bars = [b if b > 0.10 else 0.0 for b in bars]
+                
+                return bars
+            else:
+                # Fallback sem numpy: retornar valores baseados em RMS
+                rms = self._rms(raw_audio)
+                base_level = min(1.0, rms / 5000.0)
+                return [base_level] * num_bars
+                
+        except Exception as exc:
+            _LOG.debug(f"Erro ao capturar espectro: {exc}")
+            return [0.0] * num_bars
+
     def capture(self, duration: int) -> bytes:
         """
         Record *duration* seconds of system audio via WASAPI loopback.

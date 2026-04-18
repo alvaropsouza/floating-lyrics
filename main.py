@@ -19,7 +19,7 @@ from PyQt6.QtCore import Qt
 
 from config import Config
 from src.audio_capture import AudioCapture, AudioCaptureError
-from src.song_recognition import AudDRecognizer, ACRCloudRecognizer
+from src.song_recognition import AudDRecognizer, ACRCloudRecognizer, MultiProviderRecognizer
 from src.lyrics_fetcher import LyricsFetcher
 from src.worker import RecognitionWorker
 from src.ui.main_window import MainWindow
@@ -80,15 +80,18 @@ def main() -> int:
         return 1
 
     # ── Sub-components ─────────────────────────────────────────────────────
-    provider = config.get("Recognition", "recognition_provider", fallback="audd").strip().lower()
-    if provider == "acrcloud":
-        recognizer = ACRCloudRecognizer(
-            access_key=config.get("ACRCloud", "access_key", fallback=""),
-            access_secret=config.get("ACRCloud", "access_secret", fallback=""),
-            host=config.get("ACRCloud", "host", fallback="identify-eu-west-1.acrcloud.com"),
-        )
-    else:
-        recognizer = AudDRecognizer(config.get("API", "audd_api_key", fallback=""))
+    audd = AudDRecognizer(config.get("API", "audd_api_key", fallback=""))
+    acr = ACRCloudRecognizer(
+        access_key=config.get("ACRCloud", "access_key", fallback=""),
+        access_secret=config.get("ACRCloud", "access_secret", fallback=""),
+        host=config.get("ACRCloud", "host", fallback="identify-eu-west-1.acrcloud.com"),
+    )
+    recognizer = MultiProviderRecognizer(
+        audd=audd,
+        acrcloud=acr,
+        order=config.get("Recognition", "provider_fallback_order", fallback="acrcloud,audd"),
+        attempts_per_provider=config.getint("Recognition", "provider_attempts", fallback=2),
+    )
     lyrics_fetcher = LyricsFetcher(config)
 
     worker = RecognitionWorker(config, audio_capture, recognizer, lyrics_fetcher)

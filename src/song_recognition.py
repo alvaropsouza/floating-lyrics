@@ -55,12 +55,38 @@ class AudDRecognizer:
     """Identifies songs by sending WAV audio to the AudD API."""
 
     BASE_URL = "https://api.audd.io/"
-    TIMEOUT_S = 30
+    TIMEOUT_S = 10  # Reduzido de 30s para failover rápido
+    CONNECT_TIMEOUT_S = 5
 
     def __init__(self, api_key: str = "") -> None:
         self.api_key = api_key.strip()
-        self._session = requests.Session()
-        self._session.headers.update({"User-Agent": "FloatingLyrics/1.0"})
+        self._session = self._create_optimized_session()
+
+    @staticmethod
+    def _create_optimized_session() -> requests.Session:
+        """Cria sessão HTTP com keep-alive e connection pooling."""
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        session = requests.Session()
+        retry = Retry(
+            total=1,
+            backoff_factor=0.1,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["POST", "GET"]
+        )
+        adapter = HTTPAdapter(
+            pool_connections=5,
+            pool_maxsize=10,
+            max_retries=retry
+        )
+        session.mount('https://', adapter)
+        session.mount('http://', adapter)
+        session.headers.update({
+            "User-Agent": "FloatingLyrics/1.0",
+            "Connection": "keep-alive"
+        })
+        return session
 
     # ── Public ──────────────────────────────────────────────────────────────
 
@@ -101,7 +127,7 @@ class AudDRecognizer:
                 self.BASE_URL,
                 data=data,
                 files=files,
-                timeout=self.TIMEOUT_S,
+                timeout=(self.CONNECT_TIMEOUT_S, self.TIMEOUT_S),
             )
             resp.raise_for_status()
         except requests.Timeout:
@@ -122,7 +148,7 @@ class AudDRecognizer:
 
         try:
             return _json.loads(resp.content.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
+        except ValueError:
             raise RecognitionError("Resposta inesperada do AudD (não é JSON).")
 
     @staticmethod
@@ -230,14 +256,15 @@ class ACRCloudRecognizer:
       host           — e.g. identify-eu-west-1.acrcloud.com
     """
 
-    TIMEOUT_S = 30
+    TIMEOUT_S = 10  # Reduzido de 30s para failover rápido
+    CONNECT_TIMEOUT_S = 5
 
     def __init__(self, access_key: str = "", access_secret: str = "", host: str = "") -> None:
         self.access_key    = access_key.strip()
         self.access_secret = access_secret.strip()
         self.host          = host.strip().rstrip("/")
-        self._session = requests.Session()
-        self._session.headers.update({"User-Agent": "FloatingLyrics/1.0"})
+        # Reusa a sessão otimizada do AudDRecognizer
+        self._session = AudDRecognizer._create_optimized_session()
         # Compatibility shim so SettingsDialog can access api_key generically.
         self.api_key = access_key
 
@@ -288,7 +315,7 @@ class ACRCloudRecognizer:
                 self._endpoint,
                 data=data,
                 files={"sample": ("audio.wav", audio_bytes, "audio/wav")},
-                timeout=self.TIMEOUT_S,
+                timeout=(self.CONNECT_TIMEOUT_S, self.TIMEOUT_S),
             )
             resp.raise_for_status()
         except requests.Timeout:
@@ -303,7 +330,7 @@ class ACRCloudRecognizer:
 
         try:
             payload = _json.loads(resp.content.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
+        except ValueError:
             raise RecognitionError("Resposta inesperada do ACRCloud (não é JSON).")
 
         song = self._parse(payload)
@@ -366,3 +393,238 @@ class ACRCloudRecognizer:
             self._session.close()
         except Exception:
             pass
+
+
+class MultiProviderRecognizer:
+    """
+    Tries multiple recognition providers in alternating rounds.
+
+    With order acrcloud,audd and attempts_per_provider=2, sequence is:
+    acrcloud#1 -> audd#1 -> acrcloud#2 -> audd#2
+    """
+
+    def __init__(
+        self,
+        audd: AudDRecognizer,
+        acrcloud: ACRCloudRecognizer,
+        order: str = "acrcloud,audd",
+        attempts_per_provider: int = 2,
+    ) -> None:
+        self.audd = audd
+        self.acrcloud = acrcloud
+        self._order = self._parse_order(order)
+        self._attempts_per_provider = max(1, int(attempts_per_provider or 2))
+        self._fresh_capture_callback = None  # Callback para capturar áudio fresco
+
+    @staticmethod
+    def _parse_order(order: str) -> list[str]:
+        raw = [p.strip().lower() for p in (order or "").split(",") if p.strip()]
+        filtered = [p for p in raw if p in ("acrcloud", "audd")]
+        if len(filtered) != 2:
+            return ["acrcloud", "audd"]
+        if filtered[0] == filtered[1]:
+            return ["acrcloud", "audd"]
+        return filtered
+
+    def configure_fallback(self, order: str, attempts_per_provider: int) -> None:
+        self._order = self._parse_order(order)
+        self._attempts_per_provider = max(1, int(attempts_per_provider or 2))
+
+    def set_fresh_capture_callback(self, callback) -> None:
+        """
+        Define callback para capturar áudio fresco a cada tentativa.
+        
+        O callback deve retornar: (audio_bytes, capture_start_time)
+        Se None, usa o mesmo áudio para todas as tentativas (comportamento antigo).
+        """
+        self._fresh_capture_callback = callback
+
+    def update_credentials(
+        self,
+        audd_api_key: str,
+        acr_access_key: str,
+        acr_access_secret: str,
+        acr_host: str,
+    ) -> None:
+        self.audd.api_key = (audd_api_key or "").strip()
+        self.acrcloud.access_key = (acr_access_key or "").strip()
+        self.acrcloud.access_secret = (acr_access_secret or "").strip()
+        self.acrcloud.host = (acr_host or "").strip().rstrip("/")
+
+    def _provider_obj(self, name: str):
+        if name == "audd":
+            return self.audd
+        return self.acrcloud
+
+    def _run_single_attempt(
+        self,
+        provider_name: str,
+        audio_bytes: bytes,
+        capture_start_time: float,
+        provider_attempt: int,
+    ) -> tuple[str, Optional[SongInfo], float, Optional[Exception]]:
+        provider = self._provider_obj(provider_name)
+        try:
+            song, cst = provider.recognize(audio_bytes, capture_start_time)
+        except RateLimitError as exc:
+            _LOG.warning(
+                "Rate-limit no provedor %s (tentativa %d/%d do provedor)",
+                provider_name,
+                provider_attempt,
+                self._attempts_per_provider,
+            )
+            return "rate_limit", None, capture_start_time, exc
+        except RecognitionError as exc:
+            _LOG.warning(
+                "Falha de reconhecimento no provedor %s (tentativa %d/%d do provedor): %s",
+                provider_name,
+                provider_attempt,
+                self._attempts_per_provider,
+                exc,
+            )
+            return "error", None, capture_start_time, exc
+
+        if song is None:
+            _LOG.info(
+                "Sem match no provedor %s (tentativa %d/%d do provedor)",
+                provider_name,
+                provider_attempt,
+                self._attempts_per_provider,
+            )
+            return "miss", None, cst, None
+        return "hit", song, cst, None
+
+    def _recognize_with_fallback(
+        self, audio_bytes: bytes, capture_start_time: float
+    ) -> tuple[Optional[SongInfo], float, Optional[RateLimitError], Optional[RecognitionError], bool]:
+        last_rate_limit: Optional[RateLimitError] = None
+        last_error: Optional[RecognitionError] = None
+        had_clean_miss = False
+
+        rate_limited_providers: set[str] = set()
+        providers_count = len(self._order)
+        total_slots = providers_count * self._attempts_per_provider
+
+        attempt_plan = [
+            (round_idx + 1, provider_name)
+            for round_idx in range(self._attempts_per_provider)
+            for provider_name in self._order
+        ]
+
+        for slot, (provider_attempt, provider_name) in enumerate(attempt_plan, start=1):
+            if provider_name in rate_limited_providers:
+                _LOG.debug(
+                    "Pulando %s por rate-limit já detectado (rodada %d/%d)",
+                    provider_name,
+                    provider_attempt,
+                    self._attempts_per_provider,
+                )
+                continue
+
+            # Capturar áudio fresco se callback estiver configurado (exceto primeira tentativa)
+            if self._fresh_capture_callback is not None and slot > 1:
+                _LOG.info("🎵 Capturando trecho FRESCO de áudio para tentativa %d/%d", slot, total_slots)
+                try:
+                    audio_bytes, capture_start_time = self._fresh_capture_callback()
+                    if audio_bytes is None or len(audio_bytes) == 0:
+                        _LOG.warning("Captura fresca retornou áudio vazio, pulando tentativa")
+                        continue
+                except Exception as exc:
+                    _LOG.error(f"Erro ao capturar áudio fresco: {exc}", exc_info=True)
+                    # Continua com o áudio anterior se falhar
+
+            _LOG.info(
+                "Tentativa de reconhecimento %d/%d | provedor=%s | tentativa_provedor=%d/%d",
+                slot,
+                total_slots,
+                provider_name,
+                provider_attempt,
+                self._attempts_per_provider,
+            )
+
+            status, song, cst, err = self._run_single_attempt(
+                provider_name, audio_bytes, capture_start_time, provider_attempt
+            )
+            finished, song, cst, last_rate_limit, last_error, had_clean_miss = self._handle_attempt_result(
+                status=status,
+                provider_name=provider_name,
+                slot=slot,
+                total_slots=total_slots,
+                song=song,
+                cst=cst,
+                err=err,
+                rate_limited_providers=rate_limited_providers,
+                providers_count=providers_count,
+                last_rate_limit=last_rate_limit,
+                last_error=last_error,
+                had_clean_miss=had_clean_miss,
+            )
+            if finished and song is not None:
+                return song, cst, last_rate_limit, last_error, had_clean_miss
+
+        return None, capture_start_time, last_rate_limit, last_error, had_clean_miss
+
+    def _handle_attempt_result(
+        self,
+        *,
+        status: str,
+        provider_name: str,
+        slot: int,
+        total_slots: int,
+        song: Optional[SongInfo],
+        cst: float,
+        err: Optional[Exception],
+        rate_limited_providers: set[str],
+        providers_count: int,
+        last_rate_limit: Optional[RateLimitError],
+        last_error: Optional[RecognitionError],
+        had_clean_miss: bool,
+    ) -> tuple[bool, Optional[SongInfo], float, Optional[RateLimitError], Optional[RecognitionError], bool]:
+        if status == "hit" and song is not None:
+            _LOG.info(
+                "Música reconhecida via %s na tentativa global %d/%d",
+                provider_name,
+                slot,
+                total_slots,
+            )
+            return True, song, cst, last_rate_limit, last_error, had_clean_miss
+
+        if status == "miss":
+            return False, song, cst, last_rate_limit, last_error, True
+
+        if status == "rate_limit":
+            rate_limited_providers.add(provider_name)
+            if isinstance(err, RateLimitError):
+                last_rate_limit = err
+            if len(rate_limited_providers) == providers_count:
+                _LOG.warning("Todos os provedores foram rate-limited nesta sequência")
+            return False, song, cst, last_rate_limit, last_error, had_clean_miss
+
+        if isinstance(err, RecognitionError):
+            last_error = err
+        return False, song, cst, last_rate_limit, last_error, had_clean_miss
+
+    def recognize(
+        self, audio_bytes: bytes, capture_start_time: float
+    ) -> Tuple[Optional[SongInfo], float]:
+        _LOG.info(
+            "Fallback de reconhecimento iniciado | ordem=%s | tentativas_por_provedor=%d",
+            " -> ".join(self._order),
+            self._attempts_per_provider,
+        )
+
+        song, cst, last_rate_limit, last_error, had_clean_miss = self._recognize_with_fallback(
+            audio_bytes,
+            capture_start_time,
+        )
+        if song is not None:
+            return song, cst
+
+        if had_clean_miss:
+            _LOG.info("Reconhecimento finalizado sem match após alternar entre provedores")
+            return None, capture_start_time
+        if last_rate_limit is not None:
+            raise last_rate_limit
+        if last_error is not None:
+            raise last_error
+        raise RecognitionError("Nenhum provedor de reconhecimento disponível.")

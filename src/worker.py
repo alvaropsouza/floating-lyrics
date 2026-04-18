@@ -67,6 +67,9 @@ class RecognitionWorker(QThread):
         # Rate-limit cooldown.
         self._rate_limit_until: float = 0.0
         self._rate_limit_cooldown_s: float = 30 * 60  # 30 minutes
+        # Tracking state to avoid unnecessary API calls.
+        self._last_recognition_time: float = 0.0
+        self._current_song_duration_s: float = 0.0
 
         self._miss_reset_threshold = max(
             1,
@@ -74,6 +77,9 @@ class RecognitionWorker(QThread):
         )
         # Expose recognizer so MainWindow can update the API key at runtime.
         self.recognizer     = recognizer
+        
+        # Configurar callback de captura fresca no recognizer
+        self._recognizer.set_fresh_capture_callback(self._capture_fresh_audio)
 
     # ── Control ─────────────────────────────────────────────────────────────
 
@@ -92,11 +98,21 @@ class RecognitionWorker(QThread):
 
     # ── Private helpers ─────────────────────────────────────────────────────
 
+    def _capture_fresh_audio(self) -> tuple[bytes, float]:
+        """
+        Captura um trecho FRESCO de áudio para uma nova tentativa de reconhecimento.
+        
+        Retorna: (audio_bytes, capture_start_time)
+        """
+        _LOG.debug("Capturando trecho fresco de áudio...")
+        capture_start = time.perf_counter()
+        duration = self._config.getint("Capture", "capture_duration", fallback=10)
+        audio_data = self._audio.capture(duration)
+        return audio_data, capture_start
+
     def _wait_interval(self) -> None:
         """Sleep for 'recognition_interval' seconds, checking the stop flag."""
-        interval = float(
-            self._config.getint("Recognition", "recognition_interval", fallback=2)
-        )
+        interval = self._interval_for_cycle()
         if interval <= 0:
             return
         deadline = time.monotonic() + interval
@@ -105,25 +121,64 @@ class RecognitionWorker(QThread):
                 return
             time.sleep(0.1)
 
-    def _cycle(self) -> None:
-        """Run one complete capture → recognise → lyrics cycle."""
-        duration = self._capture_duration_for_cycle()
+    def _is_tracking_mode(self) -> bool:
+        if not self._config.getboolean("Recognition", "continuous_tracking", fallback=True):
+            return False
+        return self._current_song_key is not None
 
-        # ── 1. Capture ─────────────────────────────────────────────────────
+    def _should_skip_recognition(self) -> bool:
+        """
+        Evita chamadas desnecessárias às APIs quando estamos em tracking mode
+        e a música atual ainda está tocando.
+        """
+        if not self._is_tracking_mode():
+            return False
+        
+        if self._current_song_duration_s <= 0:
+            # Duração desconhecida, reconhecer após intervalo de tracking.
+            check_interval = self._config.getint("Recognition", "tracking_interval", fallback=30)
+        else:
+            # Esperar até ~10s antes do fim da música para reconhecer novamente.
+            check_interval = max(10, self._current_song_duration_s - 10)
+        
+        elapsed = time.monotonic() - self._last_recognition_time
+        return elapsed < check_interval
+
+    def _time_until_next_check(self) -> int:
+        """Retorna quantos segundos faltam até a próxima verificação de reconhecimento."""
+        if self._current_song_duration_s <= 0:
+            check_interval = self._config.getint("Recognition", "tracking_interval", fallback=30)
+        else:
+            check_interval = max(10, self._current_song_duration_s - 10)
+        
+        elapsed = time.monotonic() - self._last_recognition_time
+        return max(0, int(check_interval - elapsed))
+
+    def _interval_for_cycle(self) -> float:
+        if self._is_tracking_mode():
+            return float(
+                self._config.getint("Recognition", "tracking_interval", fallback=0)
+            )
+        return float(
+            self._config.getint("Recognition", "recognition_interval", fallback=2)
+        )
+
+    def _capture_audio(self, duration: int, tracking_mode: bool):
         try:
-            self.status_changed.emit(f"Capturando {duration}s de áudio…")
+            if tracking_mode:
+                self.status_changed.emit(f"Escutando mudança de faixa ({duration}s)…")
+            else:
+                self.status_changed.emit(f"Capturando {duration}s de áudio…")
             capture_start = time.perf_counter()
             audio_bytes = self._audio.capture(duration)
             _LOG.debug("Captura concluída em %.1fs", time.perf_counter() - capture_start)
+            return capture_start, audio_bytes
         except Exception as exc:
             _LOG.error("Erro de captura de áudio", exc_info=True)
             self.error_occurred.emit(f"Captura: {exc}")
-            return
+            return None
 
-        if self._stop_flag:
-            return
-
-        # ── 2. Recognise ─────────────────────────────────────────────────────
+    def _recognize_audio(self, audio_bytes: bytes, capture_start: float):
         now = time.monotonic()
         if now < self._rate_limit_until:
             remaining = int(self._rate_limit_until - now)
@@ -131,59 +186,63 @@ class RecognitionWorker(QThread):
             self.status_changed.emit(
                 f"⏸ Limite da API atingido — aguardando {mins}m{secs:02d}s…"
             )
-            return
+            return None
 
         try:
             self.status_changed.emit("Reconhecendo música…")
             t0 = time.perf_counter()
             song, cst = self._recognizer.recognize(audio_bytes, capture_start)
-            _LOG.info("Reconhecimento concluído em %.1fs | encontrado=%s", time.perf_counter() - t0, song is not None)
+            _LOG.info(
+                "Reconhecimento concluído em %.1fs | encontrado=%s",
+                time.perf_counter() - t0,
+                song is not None,
+            )
+            return song, cst
         except RateLimitError as exc:
             _LOG.warning("Rate limit atingido: %s", exc)
             self._rate_limit_until = time.monotonic() + self._rate_limit_cooldown_s
             self.error_occurred.emit(str(exc))
-            return
+            return None
         except Exception as exc:
             _LOG.error("Erro de reconhecimento", exc_info=True)
             self.error_occurred.emit(f"Reconhecimento: {exc}")
-            return
+            return None
 
-        if self._stop_flag:
-            return
-
-        if song is None:
-            self._miss_streak += 1
-            if self._miss_streak >= self._miss_reset_threshold:
-                self._current_song_key = None
-            self.song_not_found.emit()
-            next_duration = self._capture_duration_for_cycle()
+    def _handle_song_miss(self, tracking_mode: bool) -> None:
+        self._miss_streak += 1
+        if self._miss_streak >= self._miss_reset_threshold:
+            self._current_song_key = None
+            self._last_recognition_time = 0.0
+            self._current_song_duration_s = 0.0
+        self.song_not_found.emit()
+        next_duration = self._capture_duration_for_cycle()
+        if tracking_mode and self._current_song_key is not None:
             self.status_changed.emit(
-                f"Música não reconhecida (tentativa {self._miss_streak}, próxima captura: {next_duration}s)"
+                f"Escutando troca de faixa (sem match, próxima captura: {next_duration}s)"
             )
             return
-
-        self._miss_streak = 0
-
-        song_key = (
-            song.title.strip().lower(),
-            song.artist.strip().lower(),
-            song.album.strip().lower(),
+        self.status_changed.emit(
+            f"Música não reconhecida (tentativa {self._miss_streak}, próxima captura: {next_duration}s)"
         )
 
+    def _emit_song_status(self, song, song_key: tuple[str, str, str], tracking_mode: bool) -> None:
         self.song_found.emit(song.title, song.artist, song.album)
+        if tracking_mode and song_key != self._current_song_key:
+            self.status_changed.emit(f"Nova faixa detectada: {song.title} — {song.artist}")
+            return
         self.status_changed.emit(f"Tocando: {song.title} — {song.artist}")
 
-        # ── 3. Lyrics (only when the song changes) ───────────────────────────
+    def _handle_lyrics_for_song(self, song, song_key: tuple[str, str, str], cst: float) -> None:
+        """Buscar ou recuperar letras do cache para a música reconhecida."""
+        # Mesma música — apenas atualizar timecode.
         if song_key == self._current_song_key:
-            # Same song — refresh the timecode anchor so the UI stays in sync
-            # and the timer chain can restart if it died (e.g. end of song).
             self.timecode_updated.emit(song.timecode_ms, cst)
             return
 
         self._current_song_key = song_key
 
+        # Usar cache se disponível.
         if song_key in self._lyrics_cache:
-            # Song seen before — replay cached content without a new fetch.
             cached = self._lyrics_cache[song_key]
             if cached is not None:
                 content, synced = cached
@@ -194,9 +253,8 @@ class RecognitionWorker(QThread):
             self.timecode_updated.emit(song.timecode_ms, cst)
             return
 
-        # First time seeing this song — show loading placeholder and fetch.
+        # Buscar letra pela primeira vez.
         self.lyrics_loading.emit()
-
         try:
             self.status_changed.emit("Buscando letra…")
             t0 = time.perf_counter()
@@ -205,7 +263,6 @@ class RecognitionWorker(QThread):
         except Exception as exc:
             _LOG.error("Erro ao buscar letra", exc_info=True)
             self.error_occurred.emit(f"Letra: {exc}")
-            # Cache as None so subsequent cycles don't loop back to loading.
             self._lyrics_cache[song_key] = None
             self.lyrics_not_found.emit()
             return
@@ -226,8 +283,59 @@ class RecognitionWorker(QThread):
         _LOG.info("SYNC | song='%s - %s' timecode=%dms", song.title, song.artist, song.timecode_ms)
         self.status_changed.emit(f"Tocando: {song.title} — {song.artist}")
 
+    def _cycle(self) -> None:
+        """Run one complete capture → recognise → lyrics cycle."""
+        # Pular reconhecimento se estamos em tracking mode e a música ainda está tocando.
+        if self._should_skip_recognition():
+            next_check = self._time_until_next_check()
+            self.status_changed.emit(f"Monitorando música atual (próxima verificação em {next_check}s)")
+            return
+        
+        duration = self._capture_duration_for_cycle()
+        tracking_mode = self._is_tracking_mode()
+
+        captured = self._capture_audio(duration, tracking_mode)
+        if captured is None:
+            return
+        capture_start, audio_bytes = captured
+
+        if self._stop_flag:
+            return
+
+        recognized = self._recognize_audio(audio_bytes, capture_start)
+        if recognized is None:
+            return
+        song, cst = recognized
+
+        if self._stop_flag:
+            return
+
+        if song is None:
+            self._handle_song_miss(tracking_mode)
+            return
+
+        self._miss_streak = 0
+        # Atualizar estado de tracking para evitar chamadas desnecessárias.
+        self._last_recognition_time = time.monotonic()
+        self._current_song_duration_s = song.duration_s if song.duration_s else 0.0
+
+        song_key = (
+            song.title.strip().lower(),
+            song.artist.strip().lower(),
+            song.album.strip().lower(),
+        )
+
+        self._emit_song_status(song, song_key, tracking_mode)
+        self._handle_lyrics_for_song(song, song_key, cst)
+
     def _capture_duration_for_cycle(self) -> int:
-        base = max(3, self._config.getint("Recognition", "capture_duration", fallback=5))
+        if self._is_tracking_mode():
+            base = max(
+                10,
+                self._config.getint("Recognition", "tracking_capture_duration", fallback=10),
+            )
+        else:
+            base = max(10, self._config.getint("Recognition", "capture_duration", fallback=10))
         if self._miss_streak <= 0:
             return base
 

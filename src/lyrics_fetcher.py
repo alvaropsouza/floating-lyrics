@@ -12,15 +12,18 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import re
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from pathlib import Path
 from typing import Optional
 
 import requests
 
 _LOG = logging.getLogger(__name__)
+_CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "lyrics"
 
 
 @dataclass
@@ -49,6 +52,13 @@ def _strip_accents(s: str) -> str:
         c for c in unicodedata.normalize("NFD", s)
         if unicodedata.category(c) != "Mn"
     )
+
+
+def _slug(s: str) -> str:
+    cleaned = _strip_accents(_normalize_str(s)).strip()
+    cleaned = re.sub(r"[^a-z0-9]+", "-", cleaned)
+    cleaned = cleaned.strip("-")
+    return cleaned or "unknown"
 
 
 
@@ -121,7 +131,9 @@ class LrcLibFetcher:
         """Fire all /get duration candidates concurrently; return first synced hit, else first plain."""
         best_plain: Optional[LyricsResult] = None
         base_url, timeout = self.BASE_URL, self.TIMEOUT
-        with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+        # Limita a 3 workers para evitar rate-limiting
+        max_workers = min(3, len(candidates))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {
                 pool.submit(self._fetch_one_candidate, base_url, title, artist, album, d, timeout): d
                 for d in candidates
@@ -164,7 +176,7 @@ class LrcLibFetcher:
 
         try:
             return _safe_json(r)
-        except (ValueError, UnicodeDecodeError):
+        except ValueError:
             return None
 
     def _search(self, title: str, artist: str, duration_s: int = 0) -> Optional[LyricsResult]:
@@ -189,7 +201,7 @@ class LrcLibFetcher:
             )
             r.raise_for_status()
             results = _safe_json(r)
-        except (requests.RequestException, ValueError, UnicodeDecodeError):
+        except (requests.RequestException, ValueError):
             return None
 
         if not isinstance(results, list) or not results:
@@ -208,13 +220,14 @@ class LrcLibFetcher:
 
     @staticmethod
     def _duration_candidates(duration_s: int) -> list[int]:
+        """Reduzido de ±2s para ±1s para menos requisições paralelas (5→3)."""
         if duration_s <= 0:
             return [0]
         candidates = [duration_s]
-        for delta in (1, 2):
-            if duration_s - delta > 0:
-                candidates.append(duration_s - delta)
-            candidates.append(duration_s + delta)
+        # Apenas ±1s, não ±2s
+        if duration_s > 10:
+            candidates.append(duration_s - 1)
+            candidates.append(duration_s + 1)
         return candidates
 
     @staticmethod
@@ -352,6 +365,91 @@ class LyricsFetcher:
         # In-memory cache to avoid repeated remote calls for the same song.
         # Value is Optional[LyricsResult]: None means "already checked, not found".
         self._cache: dict[tuple[str, str, str, int], Optional[LyricsResult]] = {}
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _disk_path(title: str, artist: str, album: str) -> Path:
+        filename = f"{_slug(artist)}__{_slug(title)}__{_slug(album)}.txt"
+        return _CACHE_DIR / filename
+
+    @staticmethod
+    def _serialize_result(
+        title: str,
+        artist: str,
+        album: str,
+        duration_s: int,
+        result: LyricsResult,
+    ) -> str:
+        body = result.raw_lrc if result.synced else "\n".join(result.lines)
+        synced = "1" if result.synced else "0"
+        return "\n".join(
+            [
+                f"title={title}",
+                f"artist={artist}",
+                f"album={album}",
+                f"duration_s={max(0, int(duration_s or 0))}",
+                f"synced={synced}",
+                "---",
+                body,
+            ]
+        )
+
+    @staticmethod
+    def _deserialize_result(text: str) -> Optional[LyricsResult]:
+        if "\n---\n" not in text:
+            return None
+        header, body = text.split("\n---\n", 1)
+        meta: dict[str, str] = {}
+        for line in header.splitlines():
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            meta[k.strip().lower()] = v.strip()
+
+        synced = meta.get("synced", "0") == "1"
+        if synced:
+            lrc = body.strip("\n")
+            if not lrc:
+                return None
+            return LyricsResult(lines=lrc.splitlines(), synced=True, raw_lrc=lrc)
+
+        lines = list(body.splitlines())
+        if not any(ln.strip() for ln in lines):
+            return None
+        return LyricsResult(lines=lines, synced=False)
+
+    def _load_disk_cache(self, title: str, artist: str, album: str) -> Optional[LyricsResult]:
+        path = self._disk_path(title, artist, album)
+        if not path.exists():
+            return None
+        try:
+            parsed = self._deserialize_result(path.read_text(encoding="utf-8"))
+            if parsed is None:
+                _LOG.warning("Cache de letra inválido, ignorando: %s", path)
+                return None
+            _LOG.info("Letra carregada do cache em disco: %s", path.name)
+            return parsed
+        except Exception:
+            _LOG.warning("Falha ao ler cache de letra: %s", path, exc_info=True)
+            return None
+
+    def _save_disk_cache(
+        self,
+        title: str,
+        artist: str,
+        album: str,
+        duration_s: int,
+        result: LyricsResult,
+    ) -> None:
+        path = self._disk_path(title, artist, album)
+        try:
+            path.write_text(
+                self._serialize_result(title, artist, album, duration_s, result),
+                encoding="utf-8",
+            )
+            _LOG.info("Letra salva no cache em disco: %s", path.name)
+        except Exception:
+            _LOG.warning("Falha ao salvar cache de letra: %s", path, exc_info=True)
 
     @staticmethod
     def _cache_key(
@@ -378,14 +476,23 @@ class LyricsFetcher:
         if key in self._cache:
             return self._cache[key]
 
+        # Cache persistente: se existir TXT salvo para a música, não toca nas APIs.
+        cached_disk = self._load_disk_cache(title, artist, album)
+        if cached_disk is not None:
+            self._cache[key] = cached_disk
+            return cached_disk
+
         # 1 — lrclib.net (free, supports LRC sync)
         result = self._lrclib.fetch(title, artist, album, duration_s)
         if result is not None:
             self._cache[key] = result
+            self._save_disk_cache(title, artist, album, duration_s, result)
             return result
 
         # 2 — Musixmatch fallback (plain text)
         result = self._musixmatch.fetch(title, artist)
         # Cache both hits and misses so we don't spam providers.
         self._cache[key] = result
+        if result is not None:
+            self._save_disk_cache(title, artist, album, duration_s, result)
         return result

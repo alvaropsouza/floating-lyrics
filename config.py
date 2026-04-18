@@ -28,6 +28,8 @@ _DEFAULTS: dict[str, dict[str, str]] = {
     },
     "Recognition": {
         "recognition_provider": "audd",
+        "provider_fallback_order": "acrcloud,audd",
+        "provider_attempts": "2",
         "capture_duration": "5",
         "recognition_interval": "2",
         "silence_threshold": "100",

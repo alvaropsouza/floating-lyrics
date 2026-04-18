@@ -334,7 +334,21 @@ class LyricsWindow(QWidget):
 
     def _start_worker(self) -> None:
         key = self._config.get("API", "audd_api_key", fallback="")
-        self._worker.recognizer.api_key = key
+        rec = self._worker.recognizer
+        from src.song_recognition import AudDRecognizer, MultiProviderRecognizer
+        if isinstance(rec, AudDRecognizer):
+            rec.api_key = key
+        elif isinstance(rec, MultiProviderRecognizer):
+            rec.update_credentials(
+                audd_api_key=key,
+                acr_access_key=self._config.get("ACRCloud", "access_key", fallback=""),
+                acr_access_secret=self._config.get("ACRCloud", "access_secret", fallback=""),
+                acr_host=self._config.get("ACRCloud", "host", fallback="identify-eu-west-1.acrcloud.com"),
+            )
+            rec.configure_fallback(
+                self._config.get("Recognition", "provider_fallback_order", fallback="acrcloud,audd"),
+                self._config.getint("Recognition", "provider_attempts", fallback=2),
+            )
         if not self._worker.isRunning():
             self._worker.start()
         self._btn_toggle.setText("■")

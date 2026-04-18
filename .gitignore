@@ -30,10 +30,19 @@ Thumbs.db
 .env
 .env.*
 *.local
+*.local.*
 config.local.ini
 config.ini
+
 # Logs
 *.log
+server.log
+floating_lyrics.log
 
 # PyInstaller
 *.spec
+cache
+
+# Local development scripts
+*.bat.local
+*.sh.local

@@ -2,6 +2,10 @@
 
 Exibe as letras de músicas tocando no seu PC em uma janela flutuante e transparente, sincronizadas em tempo real com o áudio do sistema.
 
+**Duas versões disponíveis:**
+- **PyQt6** (standalone) — UI tradicional com Python (legado)
+- **Flutter** (moderna) — UI nativa com backend Python headless via WebSocket
+
 ```
 ┌─────────────────────────────────────────────────────┐
 │ Daft Punk — Get Lucky                               │
@@ -10,6 +14,33 @@ Exibe as letras de músicas tocando no seu PC em uma janela flutuante e transpar
 │  WE'RE UP ALL NIGHT FOR GOOD FUN                    │  ← linha atual
 │  We're up all night to get lucky                    │
 └─────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🚀 Quick Start
+
+### Versão Flutter (Recomendado - UI Moderna + Backend Headless)
+
+```bash
+# Terminal 1: Backend Python (SEM PyQt6)
+pip install -r requirements_headless.txt
+python main_server_headless.py
+# OU use: start_server.bat
+
+# Terminal 2: Frontend Flutter
+cd flutter_ui
+flutter run -d windows
+```
+
+📖 **[Guia completo Flutter →](flutter_ui/QUICKSTART.md)**
+
+### Versão PyQt6 (Legado - Standalone)
+
+```bash
+# Instalar e rodar (com PyQt6)
+pip install -r requirements.txt
+python main.py
 ```
 
 ---

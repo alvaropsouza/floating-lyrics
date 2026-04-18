@@ -118,6 +118,24 @@ class SettingsDialog(QDialog):
         self._combo_provider.setCurrentIndex(0 if current_provider != "acrcloud" else 1)
         fl.addRow("Provedor:", self._combo_provider)
 
+        self._combo_fallback = QComboBox()
+        self._combo_fallback.addItem("ACRCloud → AudD", "acrcloud,audd")
+        self._combo_fallback.addItem("AudD → ACRCloud", "audd,acrcloud")
+        fallback_order = self._config.get(
+            "Recognition", "provider_fallback_order", fallback="acrcloud,audd"
+        ).strip().lower()
+        idx = self._combo_fallback.findData(fallback_order)
+        self._combo_fallback.setCurrentIndex(0 if idx < 0 else idx)
+        fl.addRow("Fallback:", self._combo_fallback)
+
+        self._spin_attempts = QSpinBox()
+        self._spin_attempts.setRange(1, 5)
+        self._spin_attempts.setValue(
+            self._config.getint("Recognition", "provider_attempts", fallback=2)
+        )
+        self._spin_attempts.setSuffix(" tentativas/provedor")
+        fl.addRow("Tentativas:", self._spin_attempts)
+
         # ── AudD fields ──────────────────────────────────────────────────────
         self._edit_audd = QLineEdit()
         self._edit_audd.setPlaceholderText("Chave AudD (vazio = modo teste, ~10 req/dia)")
@@ -255,7 +273,11 @@ class SettingsDialog(QDialog):
     @pyqtSlot()
     def _save_api(self) -> None:
         provider = self._combo_provider.currentData()
+        fallback_order = self._combo_fallback.currentData()
+        provider_attempts = self._spin_attempts.value()
         self._config.set("Recognition", "recognition_provider", provider)
+        self._config.set("Recognition", "provider_fallback_order", fallback_order)
+        self._config.set("Recognition", "provider_attempts", provider_attempts)
         self._config.set("API", "audd_api_key",       self._edit_audd.text().strip())
         self._config.set("API", "musixmatch_api_key", self._edit_mx.text().strip())
         self._config.set("ACRCloud", "access_key",    self._edit_acr_key.text().strip())
@@ -264,14 +286,22 @@ class SettingsDialog(QDialog):
         self._config.save()
         # Update running recognizer credentials (no restart needed for same provider).
         rec = self._worker.recognizer
-        from src.song_recognition import AudDRecognizer, ACRCloudRecognizer
+        from src.song_recognition import AudDRecognizer, ACRCloudRecognizer, MultiProviderRecognizer
         if isinstance(rec, AudDRecognizer):
             rec.api_key = self._edit_audd.text().strip()
         elif isinstance(rec, ACRCloudRecognizer):
             rec.access_key    = self._edit_acr_key.text().strip()
             rec.access_secret = self._edit_acr_secret.text().strip()
             rec.host          = self._edit_acr_host.text().strip()
-        self._btn_save_api.setText("Salvo ✓ (reinicie para trocar provedor)")
+        elif isinstance(rec, MultiProviderRecognizer):
+            rec.update_credentials(
+                self._edit_audd.text().strip(),
+                self._edit_acr_key.text().strip(),
+                self._edit_acr_secret.text().strip(),
+                self._edit_acr_host.text().strip(),
+            )
+            rec.configure_fallback(fallback_order, provider_attempts)
+        self._btn_save_api.setText("Salvo ✓")
         QTimer.singleShot(3000, lambda: self._btn_save_api.setText("Salvar configurações de API"))
 
     @pyqtSlot()

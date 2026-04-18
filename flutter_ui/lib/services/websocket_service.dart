@@ -1,0 +1,183 @@
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+
+import '../models/song.dart';
+
+class WebSocketService extends ChangeNotifier {
+  static const String _wsUrl = 'ws://127.0.0.1:8765/ws';
+  
+  WebSocketChannel? _channel;
+  StreamSubscription? _subscription;
+  
+  // Estado
+  String _status = 'Conectando...';
+  Song? _currentSong;
+  LyricsData? _lyrics;
+  int _timecodeMs = 0;
+  bool _isConnected = false;
+  String? _error;
+  List<double> _audioSpectrum = List.filled(32, 0.0);
+  int _lastSpectrumNotifyTime = 0;
+
+  // Getters
+  String get status => _status;
+  Song? get currentSong => _currentSong;
+  LyricsData? get lyrics => _lyrics;
+  int get timecodeMs => _timecodeMs;
+  bool get isConnected => _isConnected;
+  String? get error => _error;
+  List<double> get audioSpectrum => _audioSpectrum;
+
+  void connect() {
+    try {
+      _channel = WebSocketChannel.connect(Uri.parse(_wsUrl));
+      _isConnected = true;
+      _error = null;
+      
+      _subscription = _channel!.stream.listen(
+        _handleMessage,
+        onError: _handleError,
+        onDone: _handleDisconnect,
+      );
+      
+      debugPrint('WebSocket conectado: $_wsUrl');
+      notifyListeners();
+    } catch (e) {
+      _handleError(e);
+    }
+  }
+
+  void disconnect() {
+    _subscription?.cancel();
+    _channel?.sink.close();
+    _isConnected = false;
+    notifyListeners();
+  }
+
+  void _handleMessage(dynamic message) {
+    try {
+      final data = jsonDecode(message as String) as Map<String, dynamic>;
+      final type = data['type'] as String?;
+      final payload = data['data'] as Map<String, dynamic>?;
+
+      // Log apenas eventos importantes (não audio_spectrum)
+      if (type != 'audio_spectrum' && type != 'timecode_updated') {
+        debugPrint('WS <- $type');
+      }
+
+      switch (type) {
+        case 'connected':
+          _status = payload?['message'] ?? 'Conectado';
+          break;
+
+        case 'status_changed':
+          _status = payload?['status'] ?? '';
+          break;
+
+        case 'song_found':
+          _currentSong = Song.fromJson(payload ?? {});
+          _status = 'Tocando: $_currentSong';
+          break;
+
+        case 'song_not_found':
+          _status = 'Música não reconhecida';
+          break;
+
+        case 'lyrics_ready':
+          final content = payload?['lyrics'] as String? ?? '';
+          final synced = payload?['synced'] as bool? ?? false;
+          _lyrics = LyricsData(content: content, synced: synced);
+          if (_lyrics!.lines.isEmpty) {
+            debugPrint('⚠️ Letras vazias após parse (${content.length} chars)');
+          }
+          break;
+
+        case 'lyrics_not_found':
+          _lyrics = null;
+          _status = 'Letra não encontrada';
+          break;
+
+        case 'timecode_updated':
+          _timecodeMs = payload?['timecode_ms'] as int? ?? 0;
+          break;
+
+        case 'error':
+          _error = payload?['message'] as String?;
+          debugPrint('❌ Erro: $_error');
+          break;
+
+        case 'audio_spectrum':
+          final spectrum = payload?['spectrum'] as List<dynamic>?;
+          if (spectrum != null) {
+            _audioSpectrum = spectrum.map((e) => (e as num).toDouble()).toList();
+            // Throttle: notificar apenas a cada 50ms (20 FPS)
+            final now = DateTime.now().millisecondsSinceEpoch;
+            if (now - _lastSpectrumNotifyTime >= 50) {
+              _lastSpectrumNotifyTime = now;
+              notifyListeners();
+            }
+          }
+          return;
+
+        default:
+          if (type != null) {
+            debugPrint('⚠️ Tipo desconhecido: $type');
+          }
+      }
+
+      notifyListeners();
+    } catch (e) {
+      debugPrint('Erro ao processar mensagem: $e');
+    }
+  }
+
+  void _handleError(dynamic error) {
+    debugPrint('WebSocket erro: $error');
+    _isConnected = false;
+    _error = error.toString();
+    notifyListeners();
+
+    // Tentar reconectar após 5 segundos
+    Future.delayed(const Duration(seconds: 5), () {
+      if (!_isConnected) {
+        debugPrint('Tentando reconectar...');
+        connect();
+      }
+    });
+  }
+
+  void _handleDisconnect() {
+    debugPrint('WebSocket desconectado');
+    _isConnected = false;
+    _status = 'Desconectado';
+    notifyListeners();
+
+    // Tentar reconectar
+    Future.delayed(const Duration(seconds: 3), () {
+      if (!_isConnected) {
+        connect();
+      }
+    });
+  }
+
+  // Enviar mensagens para o backend
+  void sendMessage(String type, Map<String, dynamic> data) {
+    if (_channel != null && _isConnected) {
+      final message = jsonEncode({'type': type, 'data': data});
+      _channel!.sink.add(message);
+      debugPrint('WS -> $type');
+    }
+  }
+
+  void ping() {
+    sendMessage('ping', {});
+  }
+
+  @override
+  void dispose() {
+    disconnect();
+    super.dispose();
+  }
+}

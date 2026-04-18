@@ -1,0 +1,350 @@
+"""
+Background worker headless (sem PyQt6) para usar com WebSocket.
+
+Roda em thread separada e usa callbacks ao invés de Qt signals.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from typing import Callable, Any
+
+from src.song_recognition import RateLimitError
+
+
+_LOG = logging.getLogger(__name__)
+
+
+class RecognitionWorkerHeadless(threading.Thread):
+    """
+    Worker de reconhecimento sem dependências PyQt6.
+    
+    Infinite loop:
+      1. Capture system audio (WASAPI loopback)
+      2. Send to recognition APIs
+      3. Fetch lyrics if the song changed
+      4. Chama callbacks para notificar eventos
+    """
+
+    def __init__(self, config, audio_capture, recognizer, lyrics_fetcher):
+        super().__init__(daemon=True, name="RecognitionWorker")
+        self._config = config
+        self._audio = audio_capture
+        self._recognizer = recognizer
+        self._lyrics = lyrics_fetcher
+        self._stop_flag = threading.Event()
+        self._current_song_key: tuple[str, str, str] | None = None
+        self._miss_streak: int = 0
+        self._lyrics_cache: dict[tuple[str, str, str], tuple[str, bool] | None] = {}
+        self._rate_limit_until: float = 0.0
+        self._rate_limit_cooldown_s: float = 30 * 60  # 30 minutes
+        self._last_recognition_time: float = 0.0
+        self._current_song_duration_s: float = 0.0
+
+        self._miss_reset_threshold = max(
+            1,
+            self._config.getint("Recognition", "tracking_miss_reset", fallback=3),
+        )
+        
+        # Callbacks para eventos
+        self._callbacks: dict[str, list[Callable]] = {
+            'status_changed': [],
+            'song_found': [],
+            'song_not_found': [],
+            'lyrics_loading': [],
+            'lyrics_ready': [],
+            'lyrics_not_found': [],
+            'timecode_updated': [],
+            'error_occurred': [],
+            'audio_spectrum': [],  # Novo evento para espectro de áudio
+        }
+        
+        # Thread separada para captura de espectro em tempo real
+        self._spectrum_thread: threading.Thread | None = None
+        self._spectrum_running = False
+        
+        # Configurar callback de captura fresca no recognizer
+        self._recognizer.set_fresh_capture_callback(self._capture_fresh_audio)
+
+    # ── Event callbacks ─────────────────────────────────────────────────────
+
+    def on(self, event: str, callback: Callable) -> None:
+        """Registra callback para um evento."""
+        if event in self._callbacks:
+            self._callbacks[event].append(callback)
+
+    def _emit(self, event: str, *args, **kwargs) -> None:
+        """Dispara todos os callbacks registrados para um evento."""
+        for callback in self._callbacks.get(event, []):
+            try:
+                callback(*args, **kwargs)
+            except Exception as exc:
+                _LOG.error(f"Erro no callback {event}: {exc}", exc_info=True)
+
+    # ── Control ─────────────────────────────────────────────────────────────
+
+    def stop(self) -> None:
+        """Para a thread."""
+        self._spectrum_running = False
+        self._stop_flag.set()
+
+    def join(self, timeout=None) -> None:
+        """Aguarda a thread terminar."""
+        if self._spectrum_thread and self._spectrum_thread.is_alive():
+            self._spectrum_thread.join(timeout=2)
+        super().join(timeout)
+
+    # ── Thread entry point ──────────────────────────────────────────────────
+
+    def run(self) -> None:
+        """Loop principal de reconhecimento."""
+        _LOG.info("Worker headless iniciado")
+        
+        # Iniciar thread de captura de espectro
+        self._spectrum_running = True
+        self._spectrum_thread = threading.Thread(
+            target=self._spectrum_loop,
+            daemon=True,
+            name="SpectrumCapture"
+        )
+        self._spectrum_thread.start()
+        
+        while not self._stop_flag.is_set():
+            self._cycle()
+            if self._stop_flag.is_set():
+                break
+            self._wait_interval()
+        
+        # Parar thread de espectro
+        self._spectrum_running = False
+        _LOG.info("Worker headless parado")
+
+    def _spectrum_loop(self) -> None:
+        """Loop contínuo de captura de espectro de áudio."""
+        _LOG.info("🎵 Thread de captura de espectro iniciada")
+        error_count = 0
+        max_errors = 10
+        success_count = 0
+        first_call = True
+        
+        while self._spectrum_running:
+            try:
+                if first_call:
+                    _LOG.info("Iniciando primeira captura de espectro...")
+                    first_call = False
+                    
+                # Capturar espectro (100ms de áudio)
+                spectrum = self._audio.capture_spectrum(duration_ms=100, num_bars=32)
+                self._emit('audio_spectrum', spectrum)
+                error_count = 0  # Reset contador de erros em caso de sucesso
+                success_count += 1
+                
+                # Log a cada 200 capturas bem-sucedidas (~10 segundos)
+                if success_count % 200 == 0:
+                    _LOG.info(f"✅ Espectro capturado: {success_count} capturas bem-sucedidas")
+                    
+            except Exception as exc:
+                error_count += 1
+                if error_count <= 3:  # Logar apenas primeiros 3 erros
+                    _LOG.warning(f"Erro ao capturar espectro ({error_count}/{max_errors}): {exc}")
+                elif error_count == max_errors:
+                    _LOG.error(f"Muitos erros consecutivos ao capturar espectro. Parando thread.")
+                    break
+            
+            # Atualizar ~20 vezes por segundo (50ms de sleep)
+            time.sleep(0.05)
+        
+        _LOG.info("Thread de espectro parada")
+
+    # ── Private helpers ─────────────────────────────────────────────────────
+
+    def _capture_fresh_audio(self) -> tuple[bytes, float]:
+        """
+        Captura um trecho FRESCO de áudio para uma nova tentativa de reconhecimento.
+        
+        Retorna: (audio_bytes, capture_start_time)
+        """
+        _LOG.debug("Capturando trecho fresco de áudio...")
+        capture_start = time.perf_counter()
+        duration = self._config.getint("Capture", "capture_duration", fallback=10)
+        audio_data = self._audio.capture(duration)
+        return audio_data, capture_start
+
+    def _wait_interval(self) -> None:
+        """Sleep for 'recognition_interval' seconds, checking the stop flag."""
+        interval = self._interval_for_cycle()
+        self._stop_flag.wait(timeout=interval)
+
+    def _interval_for_cycle(self) -> float:
+        """Return the appropriate interval based on current state."""
+        if self._current_song_key is None:
+            return self._config.getfloat("Recognition", "recognition_interval", fallback=5.0)
+        else:
+            return self._config.getfloat("Recognition", "tracking_interval", fallback=30.0)
+
+    def _cycle(self) -> None:
+        """Single recognition cycle."""
+        start_time = time.perf_counter()
+        
+        # Check rate limit
+        now = time.perf_counter()
+        if now < self._rate_limit_until:
+            remaining = int(self._rate_limit_until - now)
+            if remaining % 60 == 0:  # Log every minute
+                _LOG.warning(f"Rate-limited. Retrying in {remaining // 60} minutes")
+            return
+
+        # Emit status
+        self._emit('status_changed', "🎵 Capturando áudio...")
+
+        # Capture audio
+        try:
+            capture_start = time.perf_counter()
+            duration = self._config.getint("Capture", "capture_duration", fallback=10)
+            audio_data = self._audio.capture(duration)
+            if audio_data is None or len(audio_data) == 0:
+                _LOG.debug("No audio captured")
+                return
+        except Exception as exc:
+            _LOG.error(f"Erro ao capturar áudio: {exc}", exc_info=True)
+            self._emit('error_occurred', f"Erro ao capturar áudio: {exc}")
+            return
+
+        # Skip recognition if in tracking mode and not needed
+        if self._should_skip_recognition():
+            _LOG.debug("Skipping recognition (tracking mode)")
+            return
+
+        # Recognize
+        self._emit('status_changed', "🔍 Reconhecendo música...")
+        try:
+            result, updated_capture_start = self._recognizer.recognize(audio_data, capture_start)
+            elapsed = time.perf_counter() - start_time
+            found = result is not None
+            _LOG.debug(f"{elapsed:.1f}s | encontrado={found}")
+            
+            if found and result:
+                self._handle_song_found(result, updated_capture_start)
+            else:
+                self._handle_song_not_found()
+                
+        except RateLimitError as exc:
+            _LOG.error(f"Rate limit atingido: {exc}")
+            self._rate_limit_until = time.perf_counter() + self._rate_limit_cooldown_s
+            self._emit('error_occurred', "⚠️ Limite de API atingido. Aguardando...")
+        except Exception as exc:
+            _LOG.error(f"Erro no reconhecimento: {exc}", exc_info=True)
+            self._emit('error_occurred', f"Erro: {exc}")
+
+    def _should_skip_recognition(self) -> bool:
+        """
+        Se estamos rastreando uma música e ainda não passou tempo suficiente,
+        pula o reconhecimento para economizar API calls.
+        """
+        if self._current_song_key is None:
+            return False
+        
+        if self._current_song_duration_s <= 0:
+            return False
+        
+        time_since_last = time.perf_counter() - self._last_recognition_time
+        time_until_next = self._time_until_next_check()
+        
+        return time_since_last < time_until_next
+
+    def _time_until_next_check(self) -> float:
+        """Calcula quando fazer o próximo check baseado na duração da música."""
+        if self._current_song_duration_s <= 0:
+            return 0.0
+        
+        # Esperar até perto do fim da música
+        # Se a música tem 3min, verificar novamente em ~2.5min
+        return self._current_song_duration_s * 0.85
+
+    def _handle_song_found(self, result, capture_start: float) -> None:
+        """Processa resultado quando música é encontrada."""
+        song_key = (result.title, result.artist, result.album or "")
+        self._last_recognition_time = time.perf_counter()
+        self._current_song_duration_s = result.duration_s or 0.0
+        
+        # Emit song found
+        self._emit('song_found', result.title, result.artist, result.album or "")
+        
+        # Check if song changed
+        if song_key == self._current_song_key:
+            # Same song, just update timecode
+            if result.timecode_ms is not None and result.timecode_ms > 0:
+                self._emit('timecode_updated', result.timecode_ms, capture_start)
+            self._miss_streak = 0
+            return
+        
+        # New song detected
+        _LOG.info(f"Nova música: {result.title} - {result.artist}")
+        self._current_song_key = song_key
+        self._miss_streak = 0
+        
+        # Fetch and emit lyrics
+        self._handle_lyrics_for_song(song_key, result, capture_start)
+
+    def _handle_lyrics_for_song(self, song_key, result, capture_start: float) -> None:
+        """Busca e emite letras para a música."""
+        # Check cache
+        if song_key in self._lyrics_cache:
+            cached = self._lyrics_cache[song_key]
+            if cached is None:
+                self._emit('lyrics_not_found')
+            else:
+                content, synced = cached
+                self._emit('lyrics_ready', content, synced, capture_start)
+            
+            # Update timecode anyway
+            if result.timecode_ms is not None and result.timecode_ms > 0:
+                self._emit('timecode_updated', result.timecode_ms, capture_start)
+            return
+        
+        # Fetch lyrics
+        self._emit('status_changed', "📝 Buscando letras...")
+        self._emit('lyrics_loading')
+        
+        try:
+            lyrics_result = self._lyrics.fetch(
+                title=result.title,
+                artist=result.artist,
+                album=result.album,
+                duration_s=result.duration_s,
+            )
+            
+            if lyrics_result.lines:
+                # Converter para formato de texto
+                if lyrics_result.synced and lyrics_result.raw_lrc:
+                    lyrics_text = lyrics_result.raw_lrc
+                else:
+                    lyrics_text = "\n".join(lyrics_result.lines)
+                
+                self._lyrics_cache[song_key] = (lyrics_text, lyrics_result.synced)
+                self._emit('lyrics_ready', lyrics_text, lyrics_result.synced, capture_start)
+                
+                # Update timecode
+                if result.timecode_ms is not None and result.timecode_ms > 0:
+                    self._emit('timecode_updated', result.timecode_ms, capture_start)
+            else:
+                self._lyrics_cache[song_key] = None
+                self._emit('lyrics_not_found')
+                
+        except Exception as exc:
+            _LOG.error(f"Erro ao buscar letras: {exc}", exc_info=True)
+            self._lyrics_cache[song_key] = None
+            self._emit('lyrics_not_found')
+
+    def _handle_song_not_found(self) -> None:
+        """Processa resultado quando música não é encontrada."""
+        self._emit('song_not_found')
+        self._miss_streak += 1
+        
+        if self._miss_streak >= self._miss_reset_threshold:
+            if self._current_song_key is not None:
+                _LOG.info(f"Resetando música atual após {self._miss_streak} falhas")
+                self._current_song_key = None
+                self._current_song_duration_s = 0.0

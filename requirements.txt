@@ -15,5 +15,8 @@ pyaudiowpatch>=0.2.12.6
 # HTTP client for AudD, lrclib.net, Musixmatch
 requests>=2.31.0
 
+# WebSocket server para comunicação com Flutter frontend
+aiohttp>=3.9.0
+
 # Fast numeric audio processing (RMS, normalization — replaces pure-Python struct loops)
 numpy>=1.26.0
