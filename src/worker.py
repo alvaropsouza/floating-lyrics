@@ -107,7 +107,6 @@ class RecognitionWorker(QThread):
 
     def _cycle(self) -> None:
         """Run one complete capture → recognise → lyrics cycle."""
-        import time as _t
         duration = self._capture_duration_for_cycle()
 
         # ── 1. Capture ─────────────────────────────────────────────────────
@@ -157,7 +156,10 @@ class RecognitionWorker(QThread):
             if self._miss_streak >= self._miss_reset_threshold:
                 self._current_song_key = None
             self.song_not_found.emit()
-            self.status_changed.emit("Música não reconhecida")
+            next_duration = self._capture_duration_for_cycle()
+            self.status_changed.emit(
+                f"Música não reconhecida (tentativa {self._miss_streak}, próxima captura: {next_duration}s)"
+            )
             return
 
         self._miss_streak = 0
@@ -225,4 +227,11 @@ class RecognitionWorker(QThread):
         self.status_changed.emit(f"Tocando: {song.title} — {song.artist}")
 
     def _capture_duration_for_cycle(self) -> int:
-        return self._config.getint("Recognition", "capture_duration", fallback=5)
+        base = max(3, self._config.getint("Recognition", "capture_duration", fallback=5))
+        if self._miss_streak <= 0:
+            return base
+
+        # Aumenta gradualmente a janela de captura após falhas consecutivas.
+        # Isso ajuda em trechos com introdução/frase curta sem exigir mudança manual.
+        bonus = min(self._miss_streak, 4) * 2
+        return min(12, base + bonus)

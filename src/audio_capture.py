@@ -7,12 +7,18 @@ loopback no Windows.  Instale com:  pip install pyaudiowpatch
 
 import io
 import logging
-import math
-import struct
 import wave
 from typing import Optional
 
 _LOG = logging.getLogger(__name__)
+
+try:
+    import numpy as _np
+    _NUMPY_AVAILABLE = True
+except ImportError:
+    import math
+    import struct
+    _NUMPY_AVAILABLE = False
 
 try:
     import pyaudiowpatch as pyaudio  # type: ignore
@@ -173,9 +179,14 @@ class AudioCapture:
     @staticmethod
     def _rms(raw_bytes: bytes) -> float:
         """Compute Root-Mean-Square of 16-bit little-endian PCM samples."""
-        count = len(raw_bytes) // 2
-        if count == 0:
+        if not raw_bytes:
             return 0.0
+        if _NUMPY_AVAILABLE:
+            samples = _np.frombuffer(raw_bytes, dtype="<i2").astype(_np.float32)
+            return float(_np.sqrt(_np.mean(samples ** 2)))
+        # Pure-Python fallback
+        import math, struct
+        count = len(raw_bytes) // 2
         shorts = struct.unpack_from(f"<{count}h", raw_bytes)
         return math.sqrt(sum(s * s for s in shorts) / count)
 
@@ -188,21 +199,25 @@ class AudioCapture:
         If the audio is already at or near peak (peak >= 28000) it is returned
         unchanged to avoid integer overflow artifacts.
         """
-        count = len(raw_bytes) // 2
-        if count == 0:
+        if not raw_bytes:
             return raw_bytes
+        if _NUMPY_AVAILABLE:
+            samples = _np.frombuffer(raw_bytes, dtype="<i2").astype(_np.float32)
+            peak = float(_np.abs(samples).max())
+            if peak < 10 or peak >= 28000:
+                return raw_bytes
+            gain = 32767.0 / peak
+            return _np.clip(samples * gain, -32768, 32767).astype("<i2").tobytes()
+        # Pure-Python fallback
+        import struct
+        count = len(raw_bytes) // 2
         fmt = f"<{count}h"
         samples = struct.unpack_from(fmt, raw_bytes)
         peak = max(abs(s) for s in samples)
-        if peak < 10:
-            # Effectively silent — nothing to normalize.
-            return raw_bytes
-        if peak >= 28000:
-            # Already loud enough; skip to avoid clipping.
+        if peak < 10 or peak >= 28000:
             return raw_bytes
         gain = 32767.0 / peak
-        normalized = bytes(struct.pack(fmt, *(max(-32768, min(32767, int(s * gain))) for s in samples)))
-        return normalized
+        return bytes(struct.pack(fmt, *(max(-32768, min(32767, int(s * gain))) for s in samples)))
 
     # ── Capture ─────────────────────────────────────────────────────────────
 

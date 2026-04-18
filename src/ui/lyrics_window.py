@@ -263,7 +263,7 @@ class LyricsWindow(QWidget):
 
     def _refresh_cache(self) -> None:
         """Snapshot display values — called after settings change."""
-        self._font_size     = self._config.getint("Display", "font_size",     fallback=16)
+        self._font_size     = max(8, self._config.getint("Display", "font_size", fallback=16))
         self._font_color    = self._config.get("Display",    "font_color",    fallback="#FFFFFF")
         self._lrc_offset_ms = self._config.getint("Display", "lrc_offset_ms", fallback=0)
         self._line_hysteresis_ms = max(
