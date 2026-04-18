@@ -8,6 +8,7 @@ loopback no Windows.  Instale com:  pip install pyaudiowpatch
 import io
 import logging
 import threading
+import time
 import wave
 from typing import Optional
 
@@ -46,8 +47,10 @@ class AudioCapture:
 
     def __init__(self, config) -> None:
         self._config = config
-        self._pa: Optional[object] = None
-        self._lock = threading.RLock()  # Lock para evitar acesso simultâneo ao WASAPI
+        self._pa: Optional[object] = None          # instância usada em capture()
+        self._pa_spectrum: Optional[object] = None # instância SEPARADA para espectro
+        self._lock = threading.RLock()             # lock exclusivo para capture()
+        self._spectrum_lock = threading.Lock()     # lock exclusivo para capture_spectrum()
         self._last_spectrum: list[float] = [0.0] * 32  # Cache do último espectro
         self._spectrum_cache_hits = 0  # Contador de cache hits consecutivos
 
@@ -67,6 +70,8 @@ class AudioCapture:
                 "Execute no terminal:  pip install pyaudiowpatch"
             )
         self._pa = pyaudio.PyAudio()
+        # Instância separada para espectro — sem conflito de lock com capture()
+        self._pa_spectrum = pyaudio.PyAudio()
         # Probe the loopback device early so the error surfaces at startup.
         self._get_loopback_device()
 
@@ -79,6 +84,13 @@ class AudioCapture:
                 _LOG.debug("Erro ao terminar PyAudio", exc_info=True)
             finally:
                 self._pa = None
+        if self._pa_spectrum is not None:
+            try:
+                self._pa_spectrum.terminate()
+            except Exception:
+                _LOG.debug("Erro ao terminar PyAudio (espectro)", exc_info=True)
+            finally:
+                self._pa_spectrum = None
 
     # ── Device discovery ────────────────────────────────────────────────────
 
@@ -194,23 +206,23 @@ class AudioCapture:
         shorts = struct.unpack_from(f"<{count}h", raw_bytes)
         return math.sqrt(sum(s * s for s in shorts) / count)
 
-    @staticmethod
-    def _normalize(raw_bytes: bytes) -> bytes:
+    def _normalize(self, raw_bytes: bytes) -> bytes:
         """
-        Scale 16-bit PCM to full dynamic range so recognition APIs receive
-        audio at maximum amplitude regardless of the current system volume.
-
-        If the audio is already at or near peak (peak >= 28000) it is returned
-        unchanged to avoid integer overflow artifacts.
+        Scale 16-bit PCM with conservative gain to improve recognition while
+        avoiding hiss/distortion caused by over-amplifying background noise.
         """
         if not raw_bytes:
             return raw_bytes
+        max_gain = self._config.getfloat("Audio", "max_normalize_gain", fallback=3.0)
+        target_peak = 22000.0
         if _NUMPY_AVAILABLE:
             samples = _np.frombuffer(raw_bytes, dtype="<i2").astype(_np.float32)
             peak = float(_np.abs(samples).max())
             if peak < 10 or peak >= 28000:
                 return raw_bytes
-            gain = 32767.0 / peak
+            gain = min(target_peak / peak, max_gain)
+            if gain <= 1.0:
+                return raw_bytes
             return _np.clip(samples * gain, -32768, 32767).astype("<i2").tobytes()
         # Pure-Python fallback
         import struct
@@ -220,8 +232,52 @@ class AudioCapture:
         peak = max(abs(s) for s in samples)
         if peak < 10 or peak >= 28000:
             return raw_bytes
-        gain = 32767.0 / peak
+        gain = min(target_peak / peak, max_gain)
+        if gain <= 1.0:
+            return raw_bytes
         return bytes(struct.pack(fmt, *(max(-32768, min(32767, int(s * gain))) for s in samples)))
+
+    def _resample_if_needed(self, raw_audio: bytes, in_rate: int, channels: int) -> tuple[bytes, int]:
+        """Optionally resample to a configured target rate for stable timing."""
+        target_rate = self._config.getint("Audio", "target_sample_rate", fallback=44100)
+        if target_rate <= 0 or target_rate == in_rate:
+            return raw_audio, in_rate
+        try:
+            if not _NUMPY_AVAILABLE:
+                _LOG.warning(
+                    "Resample desativado: NumPy não disponível (mantendo %dHz)",
+                    in_rate,
+                )
+                return raw_audio, in_rate
+
+            samples = _np.frombuffer(raw_audio, dtype="<i2")
+            if samples.size == 0:
+                return raw_audio, in_rate
+
+            if channels > 1:
+                samples_2d = samples.reshape(-1, channels)
+                in_len = samples_2d.shape[0]
+                out_len = max(1, int(round(in_len * (target_rate / in_rate))))
+                x_old = _np.arange(in_len, dtype=_np.float64)
+                x_new = _np.linspace(0, in_len - 1, out_len, dtype=_np.float64)
+
+                out = _np.empty((out_len, channels), dtype=_np.float32)
+                for ch in range(channels):
+                    out[:, ch] = _np.interp(x_new, x_old, samples_2d[:, ch])
+                converted = _np.clip(out, -32768, 32767).astype("<i2").reshape(-1).tobytes()
+            else:
+                in_len = samples.shape[0]
+                out_len = max(1, int(round(in_len * (target_rate / in_rate))))
+                x_old = _np.arange(in_len, dtype=_np.float64)
+                x_new = _np.linspace(0, in_len - 1, out_len, dtype=_np.float64)
+                out = _np.interp(x_new, x_old, samples.astype(_np.float32))
+                converted = _np.clip(out, -32768, 32767).astype("<i2").tobytes()
+
+            _LOG.info("Resample de %dHz para %dHz aplicado", in_rate, target_rate)
+            return converted, target_rate
+        except Exception as exc:
+            _LOG.warning("Falha no resample (%d -> %d): %s", in_rate, target_rate, exc)
+            return raw_audio, in_rate
 
     # ── Capture ─────────────────────────────────────────────────────────────
 
@@ -229,50 +285,32 @@ class AudioCapture:
         """
         Captura um snapshot rápido de áudio e retorna espectro de frequências.
         
-        Args:
-            duration_ms: Duração da captura em milissegundos (padrão: 100ms)
-            num_bars: Número de barras de frequência desejadas
-            
-        Returns:
-            Lista de valores normalizados [0.0-1.0] representando amplitude por banda
+        Usa instância PyAudio própria (_pa_spectrum) — nunca compete com capture().
         """
-        # NON-BLOCKING LOCK: Se não conseguir lock imediatamente (reconhecimento em andamento),
-        # retorna último espectro ao invés de bloquear. Isso mantém as barras fluidas.
-        acquired = self._lock.acquire(blocking=False)
-        
+        # Lock próprio do espectro — totalmente independente do lock de capture()
+        acquired = self._spectrum_lock.acquire(blocking=False)
         if not acquired:
-            # Lock ocupado (provavelmente pelo reconhecimento de música)
-            # Retornar cache do último espectro com decay suave
-            self._spectrum_cache_hits += 1
-            
-            # Aplicar decay gradual se ficar muito tempo sem captura nova
-            # Decay de ~5% por hit para suavizar descida
-            decay_factor = 0.95 if self._spectrum_cache_hits < 20 else 0.90
-            decayed = [v * decay_factor for v in self._last_spectrum]
-            self._last_spectrum = decayed
-            
-            return decayed.copy()
+            # Outra chamada de espectro ainda rodando — retornar cache sem decay
+            return self._last_spectrum.copy()
         
         try:
             spectrum = self._capture_spectrum_unsafe(duration_ms, num_bars)
-            self._last_spectrum = spectrum.copy()  # Atualizar cache
-            
-            # Reset contador quando volta a capturar
-            if self._spectrum_cache_hits > 0:
-                self._spectrum_cache_hits = 0
-            
+            self._last_spectrum = spectrum.copy()
+            self._spectrum_cache_hits = 0
             return spectrum
         finally:
-            self._lock.release()
+            self._spectrum_lock.release()
     
     def _capture_spectrum_unsafe(self, duration_ms: int = 100, num_bars: int = 32) -> list[float]:
-        """Versão sem lock - usada internamente após adquirir lock."""
-        if self._pa is None:
-            _LOG.debug("PyAudio not initialized, returning zeros")
-            return [0.0] * num_bars
+        """Versão sem lock - usada internamente após adquirir lock de espectro."""
+        if self._pa_spectrum is None:
+            # Fallback para _pa se espectro não inicializado
+            if self._pa is None:
+                return [0.0] * num_bars
+            pa = self._pa
+        else:
+            pa = self._pa_spectrum
         
-        # TEMPORÁRIO: Abrir/fechar streams 20x/seg causa travamento
-        # Por enquanto, retornar dados baseados em captura única simplificada
         try:
             device = self._get_loopback_device()
             sample_rate: int = int(device["defaultSampleRate"])
@@ -283,7 +321,7 @@ class AudioCapture:
             # Abrir stream de forma mais tolerante a erros
             stream = None
             try:
-                stream = self._pa.open(
+                stream = pa.open(
                     format=pyaudio.paInt16,
                     channels=channels,
                     rate=sample_rate,
@@ -308,7 +346,7 @@ class AudioCapture:
                     try:
                         stream.stop_stream()
                         stream.close()
-                    except:
+                    except Exception:
                         pass
             
             # Calcular espectro usando FFT
@@ -441,11 +479,15 @@ class AudioCapture:
         # Use a fixed read chunk of 1024 for the read loop regardless of the
         # buffer size used to open the stream.
         read_chunk = 1024 if chunk == 0 else chunk
+        capture_started_at = 0.0
+        capture_elapsed_s = 0.0
         try:
-            total_chunks = int((sample_rate / read_chunk) * duration)
+            total_chunks = max(1, round((sample_rate / read_chunk) * duration))
+            capture_started_at = time.perf_counter()
             for _ in range(total_chunks):
                 data = stream.read(read_chunk, exception_on_overflow=False)
                 frames.append(data)
+            capture_elapsed_s = max(0.001, time.perf_counter() - capture_started_at)
         except OSError as exc:
             raise AudioCaptureError(f"Erro durante a gravação: {exc}") from exc
         finally:
@@ -453,6 +495,29 @@ class AudioCapture:
             stream.close()
 
         raw_audio = b"".join(frames)
+
+        # Estimate the effective sample rate from captured byte count. Some
+        # WASAPI drivers may report/open at one rate but deliver data at
+        # another, which makes the WAV play accelerated/slow if the header
+        # uses only the nominal rate.
+        effective_rate = sample_rate
+        if channels > 0:
+            bytes_per_sample = 2  # paInt16
+            total_samples = len(raw_audio) / (channels * bytes_per_sample)
+            reference_window_s = capture_elapsed_s if capture_elapsed_s > 0 else max(0.001, float(duration))
+            estimated_rate = int(round(total_samples / reference_window_s))
+            if 8000 <= estimated_rate <= 192000:
+                deviation = abs(estimated_rate - sample_rate) / max(sample_rate, 1)
+                if deviation >= 0.02:
+                    _LOG.warning(
+                        "Taxa nominal=%dHz, taxa efetiva=%dHz (janela=%.3fs, desvio=%.1f%%). "
+                        "Usando taxa efetiva no WAV para evitar áudio acelerado.",
+                        sample_rate,
+                        estimated_rate,
+                        reference_window_s,
+                        deviation * 100,
+                    )
+                    effective_rate = estimated_rate
 
         # ── Silence check (before normalization, on raw signal) ─────────────
         # Use a very low threshold here — just enough to reject true silence.
@@ -466,15 +531,18 @@ class AudioCapture:
                 "Verifique se algo está tocando."
             )
 
-        # ── Normalize to full amplitude for better recognition ───────────────
+        # ── Normalize with conservative gain (avoid hiss) ────────────────────
         raw_audio = self._normalize(raw_audio)
+
+        # ── Optional resample to stable target rate ──────────────────────────
+        raw_audio, effective_rate = self._resample_if_needed(raw_audio, effective_rate, channels)
 
         # ── Encode as WAV ───────────────────────────────────────────────────
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(channels)
             wf.setsampwidth(self._pa.get_sample_size(pyaudio.paInt16))
-            wf.setframerate(sample_rate)
+            wf.setframerate(effective_rate)
             wf.writeframes(raw_audio)
 
         return buf.getvalue()

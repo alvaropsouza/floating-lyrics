@@ -16,3 +16,9 @@ aiohttp>=3.9.0
 
 # Fast numeric audio processing (RMS, normalization — replaces pure-Python struct loops)
 numpy>=1.26.0
+
+# Logs coloridos no terminal
+rich>=13.0.0
+
+# Auto-reload ao salvar arquivos (python main_server_headless.py --reload)
+watchfiles>=0.21.0

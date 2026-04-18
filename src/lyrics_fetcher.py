@@ -24,6 +24,7 @@ import requests
 
 _LOG = logging.getLogger(__name__)
 _CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "lyrics"
+_ARTIST_SPLIT_RE = re.compile(r'[,&/]')  # separadores de artistas compostos
 
 
 @dataclass
@@ -87,14 +88,23 @@ class LrcLibFetcher:
     ) -> Optional[LyricsResult]:
         duration = max(0, int(duration_s or 0))
 
+        # Para artistas compostos (ex: "Snoop Dogg, Wiz Khalifa, Bruno Mars"),
+        # tentar também com apenas o primeiro artista listado
+        first_artist = _ARTIST_SPLIT_RE.split(artist)[0].strip()
+
         # Fire all duration candidates in parallel to avoid sequential HTTP waits.
         candidates = self._duration_candidates(duration)
         if len(candidates) == 1:
-            # Only one candidate (e.g. duration unknown) — no need for a thread pool.
             data = self._get_by_signature(title, artist, album, candidates[0])
             result = self._parse_response(data) if data is not None else None
+            # Tentar com primeiro artista se artista composto e não encontrou
+            if result is None and first_artist and first_artist.lower() != artist.lower():
+                data = self._get_by_signature(title, first_artist, album, candidates[0])
+                result = self._parse_response(data) if data is not None else None
         else:
             result = self._parallel_get(title, artist, album, candidates)
+            if result is None and first_artist and first_artist.lower() != artist.lower():
+                result = self._parallel_get(title, first_artist, album, candidates)
 
         if result is not None:
             return result
@@ -189,6 +199,12 @@ class LrcLibFetcher:
         plain_title  = _strip_accents(title)
         if plain_artist != artist or plain_title != title:
             result = self._search_with_query(f"{plain_artist} {plain_title}", title, artist, duration_s)
+            if result is not None:
+                return result
+        # Fallback: artistas compostos ("A, B, C") — tentar só com o primeiro artista
+        first_artist = _ARTIST_SPLIT_RE.split(artist)[0].strip()
+        if first_artist and first_artist.lower() != artist.lower():
+            result = self._search_with_query(f"{first_artist} {title}", title, first_artist, duration_s)
         return result
 
     def _search_with_query(self, query: str, title: str, artist: str, duration_s: int) -> Optional[LyricsResult]:
@@ -237,7 +253,15 @@ class LrcLibFetcher:
         title_cmp  = _strip_accents(_normalize_str(title))
         artist_cmp = _strip_accents(_normalize_str(artist))
         title_sim  = SequenceMatcher(None, title_cmp,  track_name.lower()).ratio()
+        
+        # Para artistas compostos (ex: "Snoop Dogg, Wiz Khalifa"),
+        # considerar o score mais alto entre a string completa e cada artista individual
+        artist_parts = [a.strip() for a in _ARTIST_SPLIT_RE.split(artist_cmp) if a.strip()]
         artist_sim = SequenceMatcher(None, artist_cmp, artist_name.lower()).ratio()
+        for part in artist_parts:
+            part_sim = SequenceMatcher(None, part, artist_name.lower()).ratio()
+            if part_sim > artist_sim:
+                artist_sim = part_sim
 
         duration_sim = 0.0
         cand_duration = item.get("duration")

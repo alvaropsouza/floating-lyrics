@@ -25,6 +25,8 @@ _DEFAULTS: dict[str, dict[str, str]] = {
     "Audio": {
         "capture_device_index": "-1",
         "capture_device_name": "",
+        "target_sample_rate": "44100",
+        "max_normalize_gain": "2.0",
     },
     "Recognition": {
         "recognition_provider": "audd",
@@ -34,6 +36,7 @@ _DEFAULTS: dict[str, dict[str, str]] = {
         "recognition_interval": "2",
         "silence_threshold": "100",
         "tracking_miss_reset": "3",
+        "save_audio_for_debug": "false",
     },
     "Display": {
         "opacity": "0.85",

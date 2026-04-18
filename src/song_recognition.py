@@ -34,6 +34,40 @@ _LOG = logging.getLogger(__name__)
 # Diretório de cache para persistência
 _CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
 _RATE_LIMIT_CACHE_FILE = _CACHE_DIR / "rate_limits.json"
+_DEBUG_AUDIO_DIR = _CACHE_DIR / "debug_audio"  # Pasta para áudios de debug
+
+
+def _save_debug_audio(audio_bytes: bytes, provider_name: str = "unknown") -> None:
+    """Salva áudio capturado em arquivo para debug (se habilitado em config.ini).
+    
+    Args:
+        audio_bytes: Dados WAV
+        provider_name: Nome do provedor de reconhecimento (audd, acrcloud, etc)
+    """
+    try:
+        # Tentar importar config dinamicamente para não criar dependência circular
+        from config import Config
+        config = Config()
+        save_debug = config.getboolean("Recognition", "save_audio_for_debug", fallback=False)
+        
+        if not save_debug:
+            return
+        
+        # Criar pasta se não existir
+        _DEBUG_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+        
+        # Gerar timestamp para nome do arquivo
+        timestamp = _time.strftime("%Y%m%d_%H%M%S")
+        filename = _DEBUG_AUDIO_DIR / f"{timestamp}_{provider_name}.wav"
+        
+        # Salvar arquivo
+        with open(filename, "wb") as f:
+            f.write(audio_bytes)
+        
+        _LOG.debug(f"🎵 Áudio salvo para debug: {filename.relative_to(_CACHE_DIR.parent)}")
+        
+    except Exception as exc:
+        _LOG.warning(f"Não foi possível salvar áudio para debug: {exc}")
 
 
 class RecognitionError(Exception):
@@ -124,6 +158,9 @@ class AudDRecognizer:
         Raises:
             RecognitionError: for network errors or API-level errors.
         """
+        # Salvar áudio para debug se configurado
+        _save_debug_audio(audio_bytes, provider_name="audd")
+        
         payload = self._post(audio_bytes)
         song = self._parse(payload)
         return song, capture_start_time
@@ -324,6 +361,9 @@ class ACRCloudRecognizer:
                 "ACRCloud não configurado.\n"
                 "Preencha access_key, access_secret e host em Configurações."
             )
+
+        # Salvar áudio para debug se configurado
+        _save_debug_audio(audio_bytes, provider_name="acrcloud")
 
         timestamp = str(int(_time.time()))
         signature = self._sign(timestamp)

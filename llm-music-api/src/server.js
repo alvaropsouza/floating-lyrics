@@ -10,12 +10,15 @@ const fastify = require('fastify')({
   requestTimeout: 120000 // 2 minutos para inferência do modelo
 });
 const cors = require('@fastify/cors');
-const { spawn } = require('child_process');
-const path = require('path');
+const https = require('https');
+const http = require('http');
 
 // Configurações do ambiente
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
+const OLLAMA_HOST = process.env.OLLAMA_HOST || 'http://localhost:11434';
+const MODEL_SERVER = process.env.MODEL_SERVER || 'http://localhost:8000';
+const MODEL_NAME = process.env.OLLAMA_MODEL || process.env.MODEL_NAME || 'mistral';
 
 // Registrar CORS
 fastify.register(cors, {
@@ -27,77 +30,138 @@ fastify.register(cors, {
 const responseCache = new Map();
 
 /**
- * Executa inferência do modelo Python via subprocess
- * @param {string} query - Consulta do usuário
- * @returns {Promise<Object>} - Resposta do modelo
+ * Chama o servidor Python de inferência local (model_server.py)
+ * ou Ollama como fallback, dependendo do que estiver configurado.
  */
-async function runModelInference(query) {
+async function callModelServer(prompt) {
+  const body = JSON.stringify({ prompt });
+  const url = new URL(`${MODEL_SERVER}/generate`);
+  const transport = url.protocol === 'https:' ? https : http;
+
   return new Promise((resolve, reject) => {
-    const scriptPath = path.join(__dirname, 'model_inference.py');
-    
-    // Passar configurações via argumentos
-    const args = [
-      scriptPath,
-      '--query', query,
-      '--model-path', process.env.MODEL_PATH || '',
-      '--model-name', process.env.MODEL_NAME || 'mistralai/Mistral-7B-Instruct-v0.2',
-      '--max-length', process.env.MAX_LENGTH || '512',
-      '--temperature', process.env.TEMPERATURE || '0.7',
-      '--top-p', process.env.TOP_P || '0.95',
-      '--device', process.env.DEVICE || 'cpu',
-    ];
-
-    if (process.env.USE_LORA === 'true') {
-      args.push('--use-lora');
-      args.push('--lora-path', process.env.LORA_WEIGHTS_PATH || '');
-    }
-
-    if (process.env.LOAD_IN_8BIT === 'true') {
-      args.push('--load-in-8bit');
-    }
-
-    const pythonProcess = spawn('python3', args);
-    
-    let stdoutData = '';
-    let stderrData = '';
-
-    pythonProcess.stdout.on('data', (data) => {
-      stdoutData += data.toString();
-    });
-
-    pythonProcess.stderr.on('data', (data) => {
-      stderrData += data.toString();
-      fastify.log.warn(`Python stderr: ${data}`);
-    });
-
-    pythonProcess.on('close', (code) => {
-      if (code !== 0) {
-        reject(new Error(`Python process exited with code ${code}: ${stderrData}`));
-        return;
+    const req = transport.request({
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
       }
-
-      try {
-        const result = JSON.parse(stdoutData);
-        resolve(result);
-      } catch (error) {
-        reject(new Error(`Failed to parse Python output: ${error.message}\nOutput: ${stdoutData}`));
-      }
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(new Error(`Failed to parse model server response: ${data}`));
+        }
+      });
     });
-
-    pythonProcess.on('error', (error) => {
-      reject(new Error(`Failed to start Python process: ${error.message}`));
+    req.on('error', (err) => {
+      reject(new Error(`Cannot connect to model server at ${MODEL_SERVER}. Is model_server.py running? Error: ${err.message}`));
     });
+    req.write(body);
+    req.end();
   });
+}
+
+async function callOllama(prompt) {
+  const body = JSON.stringify({
+    model: MODEL_NAME,
+    prompt,
+    stream: false,
+    options: {
+      temperature: parseFloat(process.env.TEMPERATURE || '0.7'),
+      top_p: parseFloat(process.env.TOP_P || '0.95'),
+      num_predict: parseInt(process.env.MAX_LENGTH || '512'),
+    }
+  });
+
+  return new Promise((resolve, reject) => {
+    const url = new URL(`${OLLAMA_HOST}/api/generate`);
+    const transport = url.protocol === 'https:' ? https : http;
+
+    const req = transport.request({
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      }
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) {
+            reject(new Error(`Ollama error: ${parsed.error}`));
+          } else {
+            const text = parsed.response || '';
+            const jsonMatch = text.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+              try { resolve(JSON.parse(jsonMatch[0])); return; } catch (_) {}
+            }
+            resolve({ song: 'Unknown', artist: 'Unknown', album: '', lyrics: text, confidence: 0.5 });
+          }
+        } catch (e) {
+          reject(new Error(`Failed to parse Ollama response: ${data}`));
+        }
+      });
+    });
+    req.on('error', (err) => {
+      reject(new Error(`Cannot connect to Ollama at ${OLLAMA_HOST}. Error: ${err.message}`));
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
+/**
+ * Executa inferência usando model_server.py (Python local) com fallback para Ollama
+ */
+async function runModelInference(prompt) {
+  // Tentar model_server.py primeiro (Phi-3 local já baixado)
+  try {
+    return await callModelServer(prompt);
+  } catch (primaryErr) {
+    fastify.log.warn(`model_server.py unavailable (${primaryErr.message}), trying Ollama...`);
+    return await callOllama(prompt);
+  }
 }
 
 /**
  * Endpoint de saúde
  */
 fastify.get('/health', async (request, reply) => {
+  // Verificar se Ollama está acessível
+  let ollamaStatus = 'unknown';
+  try {
+    const url = new URL(`${OLLAMA_HOST}/api/tags`);
+    const transport = url.protocol === 'https:' ? https : http;
+    await new Promise((resolve, reject) => {
+      const req = transport.get(url.toString(), (res) => {
+        res.resume();
+        res.on('end', resolve);
+      });
+      req.on('error', reject);
+      req.setTimeout(3000, () => { req.destroy(); reject(new Error('timeout')); });
+    });
+    ollamaStatus = 'connected';
+  } catch (_) {
+    ollamaStatus = 'unavailable';
+  }
+
   return { 
     status: 'healthy', 
     timestamp: new Date().toISOString(),
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    ollama: ollamaStatus,
+    model: MODEL_NAME,
   };
 });
 

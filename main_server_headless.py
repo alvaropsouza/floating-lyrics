@@ -5,7 +5,8 @@ Usa apenas asyncio + threading para reconhecimento de música e WebSocket.
 Ideal para usar com o frontend Flutter.
 
 Uso:
-    python main_server_headless.py
+    python main_server_headless.py           # normal
+    python main_server_headless.py --reload  # com auto-reload ao salvar arquivos
 """
 
 import asyncio
@@ -16,15 +17,37 @@ import sys
 import time
 from pathlib import Path
 
-# Configurar logging
+# ── Logging colorido com Rich ────────────────────────────────────────────────
+from rich.logging import RichHandler
+from rich.console import Console
+from rich.theme import Theme
+
+_console = Console(theme=Theme({
+    "logging.level.debug":   "dim cyan",
+    "logging.level.info":    "bold green",
+    "logging.level.warning": "bold yellow",
+    "logging.level.error":   "bold red",
+    "logging.level.critical":"bold white on red",
+}))
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(message)s",
+    datefmt="[%H:%M:%S]",
     handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(Path(__file__).parent / "server.log", encoding="utf-8")
+        RichHandler(
+            console=_console,
+            rich_tracebacks=True,
+            show_path=False,
+            markup=True,
+        ),
+        logging.FileHandler(Path(__file__).parent / "server.log", encoding="utf-8"),
     ]
 )
+# Silenciar módulos muito verbosos
+logging.getLogger("websockets").setLevel(logging.WARNING)
+logging.getLogger("aiohttp").setLevel(logging.WARNING)
+logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 _LOG = logging.getLogger(__name__)
 
@@ -227,8 +250,44 @@ class HeadlessBackendServer:
 
 
 def main() -> int:
+    if "--reload" in sys.argv:
+        return _run_with_reload()
     server = HeadlessBackendServer()
     return server.run()
+
+
+def _run_with_reload() -> int:
+    """Reinicia o servidor automaticamente ao detectar mudanças em .py."""
+    import subprocess
+    from watchfiles import watch
+
+    src_dir = Path(__file__).parent
+    watch_paths = [str(src_dir / "src"), str(src_dir / "main_server_headless.py")]
+
+    _LOG.info("[bold cyan]🔄 Modo auto-reload ativo[/bold cyan] — monitorando [dim]src/[/dim]")
+    _LOG.info("   Salve qualquer [yellow].py[/yellow] para reiniciar o servidor automaticamente.\n")
+
+    args = [sys.executable, str(Path(__file__).resolve())]
+
+    proc = subprocess.Popen(args)
+    try:
+        for _ in watch(*watch_paths, yield_on_timeout=False):
+            _LOG.info("[yellow]🔄 Mudança detectada — reiniciando servidor...[/yellow]")
+            proc.terminate()
+            try:
+                proc.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            proc = subprocess.Popen(args)
+    except KeyboardInterrupt:
+        _LOG.info("\n[red]Parando watcher...[/red]")
+        proc.terminate()
+        try:
+            proc.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    return 0
 
 
 if __name__ == "__main__":

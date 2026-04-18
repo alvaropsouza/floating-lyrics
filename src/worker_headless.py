@@ -80,6 +80,21 @@ class RecognitionWorkerHeadless(threading.Thread):
             "Recognition", "silence_spectrum_threshold", fallback=0.05
         )  # Threshold: max 5% de energia normalizada
         
+        # Histórico de espectro para detectar mudanças bruscas
+        self._spectrum_history: list[float] = []  # Histórico de energias (últimos 20 frames = 1s)
+        self._max_spectrum_history = 20
+        self._spectrum_change_threshold = 0.4  # Mudança de 40% de energia = mudança de música
+        
+        # Detecção de confiança baixa
+        self._last_confidence: float | None = None
+        self._low_confidence_count = 0  # Contador de reconhecimentos com confiança baixa
+        self._low_confidence_threshold = 0.5  # Reconhecimentos com <50% confidence
+        self._low_confidence_trigger = 2  # Se 2 em seguida com confiança baixa = mudança
+        
+        # Rastreamento de mudanças rápidas
+        self._min_recognition_interval_s = 2.0  # Se confidence for baixa, reconhecer novamente em 2s
+        self._last_full_recognition_time: float = 0.0
+        
         # Configurar callback de captura fresca no recognizer
         self._recognizer.set_fresh_capture_callback(self._capture_fresh_audio)
 
@@ -176,15 +191,47 @@ class RecognitionWorkerHeadless(threading.Thread):
         _LOG.info("Thread de espectro parada")
 
     def _check_silence_and_reset(self, spectrum: list[float]) -> None:
-        """Detecta silêncio prolongado e força redetecção se necessário."""
+        """Detecta silêncio prolongado, mudanças bruscas de espectro e força redetecção se necessário."""
         # Ignorar se não há música tocando atualmente
         if self._current_song_key is None:
             self._low_spectrum_count = 0
+            self._spectrum_history.clear()
             return
         
         # Calcular energia média do espectro (normalizado 0-1)
         avg_energy = sum(spectrum) / len(spectrum) if spectrum else 0.0
         
+        # ═════════════════════════════════════════════════════════════════
+        # 1. Detecção de mudança bruta de espectro (crossfade ou mudança rápida)
+        # ═════════════════════════════════════════════════════════════════
+        if self._spectrum_history:
+            prev_energy = self._spectrum_history[-1]
+            energy_change = abs(avg_energy - prev_energy) / (prev_energy + 0.001)  # Evitar divisão por zero
+            
+            # Se energia mudou drasticamente (ex: 0.8 → 0.3), pode ser mudança de música
+            if energy_change > self._spectrum_change_threshold and avg_energy < 0.3:
+                _LOG.warning(
+                    f"⚠️ Mudança brusca de espectro detectada (Δ={energy_change:.1%}). "
+                    f"Resetando música e forçando redetecção rápida."
+                )
+                self._current_song_key = None
+                self._current_song_duration_s = 0.0
+                self._miss_streak = 0
+                self._low_spectrum_count = 0
+                self._spectrum_history.clear()
+                self._last_confidence = None
+                self._low_confidence_count = 0
+                self._emit('song_not_found')
+                return
+        
+        # Manter histórico de últimas energias
+        self._spectrum_history.append(avg_energy)
+        if len(self._spectrum_history) > self._max_spectrum_history:
+            self._spectrum_history.pop(0)
+        
+        # ═════════════════════════════════════════════════════════════════
+        # 2. Detecção de silêncio prolongado
+        # ═════════════════════════════════════════════════════════════════
         # Checar se está abaixo do threshold de silêncio
         if avg_energy < self._low_spectrum_max:
             self._low_spectrum_count += 1
@@ -201,6 +248,9 @@ class RecognitionWorkerHeadless(threading.Thread):
                 self._current_song_duration_s = 0.0
                 self._miss_streak = 0
                 self._low_spectrum_count = 0
+                self._spectrum_history.clear()
+                self._last_confidence = None
+                self._low_confidence_count = 0
                 
                 # Emitir evento de música não encontrada para limpar UI
                 self._emit('song_not_found')
@@ -308,19 +358,66 @@ class RecognitionWorkerHeadless(threading.Thread):
         return time_since_last < time_until_next
 
     def _time_until_next_check(self) -> float:
-        """Calcula quando fazer o próximo check baseado na duração da música."""
-        if self._current_song_duration_s <= 0:
+        """Calcula quando fazer o próximo check baseado na duração da música e confiança."""
+        if self._current_song_key is None:
             return 0.0
         
+        # Se última confiança foi baixa, reconhecer mais frequentemente (a cada 2s)
+        if self._last_confidence is not None and self._last_confidence < self._low_confidence_threshold:
+            return self._min_recognition_interval_s
+        
+        if self._current_song_duration_s <= 0:
+            # Sem duração, reconhecer a cada 15s
+            return 15.0
+        
         # Esperar até perto do fim da música
-        # Se a música tem 3min, verificar novamente em ~2.5min
-        return self._current_song_duration_s * 0.85
+        # Mas reconhecer a cada ~15s no máximo (mais responsivo para detectar mudanças)
+        tracking_interval = min(
+            self._current_song_duration_s * 0.85,  # 85% da duração
+            15.0  # Máximo 15s
+        )
+        return max(5.0, tracking_interval)  # Mínimo 5s
+
+    def _check_confidence_for_song_change(self, result) -> bool:
+        """Verifica se reconhecimento tem confiança baixa (pode ser mudança de música).
+        
+        Returns: True se deve ignorar reconhecimento (mudança suspeitada), False se OK.
+        """
+        self._last_confidence = result.confidence or 0.0
+        
+        # Se confiança for baixa, aumentar contador
+        if result.confidence is not None and result.confidence < self._low_confidence_threshold:
+            self._low_confidence_count += 1
+            _LOG.debug(
+                f"⚠️ Confiança baixa ({result.confidence:.1%}). "
+                f"Contador: {self._low_confidence_count}/{self._low_confidence_trigger}"
+            )
+        else:
+            # Reset se confiança melhorar
+            if self._low_confidence_count > 0:
+                _LOG.debug(f"✅ Confiança recuperada ({result.confidence:.1%}). Resetando contador.")
+            self._low_confidence_count = 0
+        
+        # Se muitos reconhecimentos com confiança baixa, assumir mudança de música
+        if self._low_confidence_count >= self._low_confidence_trigger:
+            _LOG.warning(
+                f"⚠️ {self._low_confidence_count} reconhecimentos com baixa confiança. "
+                f"Assumindo mudança de música."
+            )
+            self._low_confidence_count = 0
+            return True  # Ignore este resultado
+        
+        return False  # Aceitar resultado
 
     def _handle_song_found(self, result, capture_start: float) -> None:
         """Processa resultado quando música é encontrada."""
         song_key = (result.title, result.artist, result.album or "")
         self._last_recognition_time = time.perf_counter()
         self._current_song_duration_s = result.duration_s or 0.0
+        
+        # Verificar se confiança indica mudança de música
+        if self._check_confidence_for_song_change(result):
+            return  # Ignorar este reconhecimento
         
         # Emit song found
         self._emit('song_found', result.title, result.artist, result.album or "")
@@ -344,15 +441,18 @@ class RecognitionWorkerHeadless(threading.Thread):
             return
         
         # New song detected
-        _LOG.info(f"Nova música: {result.title} - {result.artist}")
+        _LOG.info(f"Nova música: {result.title} - {result.artist} (confiança={result.confidence:.1%})")
         self._current_song_key = song_key
         self._miss_streak = 0
+        self._low_confidence_count = 0  # Reset quando muda de música com sucesso
         
         # Fetch and emit lyrics
         self._handle_lyrics_for_song(song_key, result, capture_start)
 
     def _handle_lyrics_for_song(self, song_key, result, capture_start: float) -> None:
         """Busca e emite letras para a música (de forma assíncrona)."""
+        _LOG.info(f"🎵 Buscando letras para: '{result.title}' - '{result.artist}' (album='{result.album}', dur={result.duration_s}s)")
+        
         # Check cache
         if song_key in self._lyrics_cache:
             cached = self._lyrics_cache[song_key]
@@ -400,14 +500,17 @@ class RecognitionWorkerHeadless(threading.Thread):
     def _fetch_lyrics_async(self, song_key, result, capture_start: float) -> tuple:
         """Busca letras (roda em thread separada)."""
         try:
+            _LOG.info(f"🔍 Iniciando fetch de letras: title='{result.title}' artist='{result.artist}'")
             lyrics_result = self._lyrics.fetch(
                 title=result.title,
                 artist=result.artist,
                 album=result.album,
                 duration_s=result.duration_s,
             )
+            _LOG.info(f"✅ Fetch concluído: resultado={'encontrado' if lyrics_result and lyrics_result.lines else 'não encontrado'}")
             return (lyrics_result, None)
         except Exception as exc:
+            _LOG.error(f"❌ Erro ao buscar letras: {exc}", exc_info=True)
             return (None, exc)
 
     def _on_lyrics_fetched(self, future: Future, song_key, result, capture_start: float) -> None:
@@ -448,11 +551,19 @@ class RecognitionWorkerHeadless(threading.Thread):
 
     def _handle_song_not_found(self) -> None:
         """Processa resultado quando música não é encontrada."""
-        self._emit('song_not_found')
         self._miss_streak += 1
+        self._last_confidence = None  # Reset confiança
         
         if self._miss_streak >= self._miss_reset_threshold:
-            if self._current_song_key is not None:
-                _LOG.info(f"Resetando música atual após {self._miss_streak} falhas")
-                self._current_song_key = None
-                self._current_song_duration_s = 0.0
+            _LOG.warning(
+                f"🚫 Falha em {self._miss_streak} reconhecimentos consecutivos. "
+                f"Resetando música atual e força redetecção."
+            )
+            self._current_song_key = None
+            self._current_song_duration_s = 0.0
+            self._miss_streak = 0
+            self._low_confidence_count = 0  # Reset contador de confiança também
+            self._spectrum_history.clear()  # Limpar histórico de espectro
+            self._emit('song_not_found')
+        
+        self._emit('status_changed', 'Música não identificada')
