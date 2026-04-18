@@ -5,9 +5,12 @@
  * completas utilizando um modelo de linguagem local fine-tuned.
  */
 
+require('dotenv').config();
+
 const fastify = require('fastify')({ 
   logger: true,
-  requestTimeout: 120000 // 2 minutos para inferência do modelo
+  requestTimeout: 120000, // 2 minutos para inferência do modelo
+  bodyLimit: 50 * 1024 * 1024, // Aceita payloads de audio_base64 maiores (evita HTTP 413)
 });
 const cors = require('@fastify/cors');
 const https = require('https');
@@ -61,6 +64,74 @@ async function callModelServer(prompt) {
     });
     req.on('error', (err) => {
       reject(new Error(`Cannot connect to model server at ${MODEL_SERVER}. Is model_server.py running? Error: ${err.message}`));
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function callModelServerTrainIndex(datasetPath) {
+  const body = JSON.stringify({ dataset_path: datasetPath });
+  const url = new URL(`${MODEL_SERVER}/train-index`);
+  const transport = url.protocol === 'https:' ? https : http;
+
+  return new Promise((resolve, reject) => {
+    const req = transport.request({
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      }
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(new Error(`Failed to parse model server train-index response: ${data}`));
+        }
+      });
+    });
+    req.on('error', (err) => {
+      reject(new Error(`Cannot connect to model server at ${MODEL_SERVER}. Error: ${err.message}`));
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function callModelServerIdentifyAudio(audioBase64, topK = 3) {
+  const body = JSON.stringify({ audio_base64: audioBase64, top_k: topK });
+  const url = new URL(`${MODEL_SERVER}/identify-audio`);
+  const transport = url.protocol === 'https:' ? https : http;
+
+  return new Promise((resolve, reject) => {
+    const req = transport.request({
+      hostname: url.hostname,
+      port: url.port,
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      }
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(new Error(`Failed to parse model server identify-audio response: ${data}`));
+        }
+      });
+    });
+    req.on('error', (err) => {
+      reject(new Error(`Cannot connect to model server at ${MODEL_SERVER}. Error: ${err.message}`));
     });
     req.write(body);
     req.end();
@@ -219,7 +290,8 @@ fastify.post('/identify', async (request, reply) => {
       },
       metadata: {
         inference_time_ms: inferenceTime,
-        model: process.env.MODEL_NAME,
+        model: MODEL_NAME,
+        backend: MODEL_SERVER,
         timestamp: new Date().toISOString()
       }
     };
@@ -240,6 +312,88 @@ fastify.post('/identify', async (request, reply) => {
       error: 'Internal Server Error',
       message: error.message,
       timestamp: new Date().toISOString()
+    });
+  }
+});
+
+/**
+ * Treina/atualiza o indice local de reconhecimento por audio.
+ *
+ * Body opcional:
+ * {
+ *   "dataset_path": "/app/training_audio"
+ * }
+ */
+fastify.post('/recognition/train', async (request, reply) => {
+  const { dataset_path } = request.body || {};
+
+  try {
+    const result = await callModelServerTrainIndex(dataset_path || process.env.AUDIO_DATASET_PATH || '/app/training_audio');
+    if (result.error) {
+      throw new Error(result.error);
+    }
+    return { success: true, data: result };
+  } catch (error) {
+    fastify.log.error(error);
+    const statusCode = /invalido|não existe|nao existe|nenhum audio valido/i.test(error.message) ? 400 : 500;
+    return reply.code(statusCode).send({
+      success: false,
+      error: 'Internal Server Error',
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * Identifica musica por trecho de audio (base64) usando algoritmo local treinado.
+ *
+ * Body esperado:
+ * {
+ *   "audio_base64": "...",
+ *   "top_k": 3
+ * }
+ */
+fastify.post('/identify/audio', async (request, reply) => {
+  const { audio_base64, top_k = 3 } = request.body || {};
+
+  if (!audio_base64 || typeof audio_base64 !== 'string') {
+    return reply.code(400).send({
+      error: 'Bad Request',
+      message: 'audio_base64 is required and must be a string',
+    });
+  }
+
+  try {
+    const startTime = Date.now();
+    const result = await callModelServerIdentifyAudio(audio_base64, top_k);
+    if (result.error) {
+      throw new Error(result.error);
+    }
+    const inferenceTime = Date.now() - startTime;
+
+    return {
+      success: true,
+      data: {
+        song: result.song || 'Unknown',
+        artist: result.artist || 'Unknown',
+        album: result.album || '',
+        confidence: result.confidence || 0.0,
+        method: result.method || 'audio_similarity',
+        top_matches: result.top_matches || [],
+      },
+      metadata: {
+        inference_time_ms: inferenceTime,
+        backend: MODEL_SERVER,
+        timestamp: new Date().toISOString(),
+      }
+    };
+  } catch (error) {
+    fastify.log.error(error);
+    const statusCode = /audio_base64 invalido|Index de audio nao treinado|prompt is required/i.test(error.message) ? 400 : 500;
+    return reply.code(statusCode).send({
+      success: false,
+      error: 'Internal Server Error',
+      message: error.message,
     });
   }
 });
@@ -342,8 +496,9 @@ const start = async () => {
   try {
     await fastify.listen({ port: PORT, host: HOST });
     fastify.log.info(`Server listening on ${HOST}:${PORT}`);
-    fastify.log.info(`Model: ${process.env.MODEL_NAME || 'Not configured'}`);
-    fastify.log.info(`Device: ${process.env.DEVICE || 'cpu'}`);
+    fastify.log.info(`Model: ${MODEL_NAME}`);
+    fastify.log.info(`Model server: ${MODEL_SERVER}`);
+    fastify.log.info(`Ollama host (fallback): ${OLLAMA_HOST}`);
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);

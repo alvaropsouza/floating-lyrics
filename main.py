@@ -19,7 +19,12 @@ from PyQt6.QtCore import Qt
 
 from config import Config
 from src.audio_capture import AudioCapture, AudioCaptureError
-from src.song_recognition import AudDRecognizer, ACRCloudRecognizer, MultiProviderRecognizer
+from src.song_recognition import (
+    ACRCloudRecognizer,
+    AudDRecognizer,
+    LLMAPIRecognizer,
+    MultiProviderRecognizer,
+)
 from src.lyrics_fetcher import LyricsFetcher
 from src.worker import RecognitionWorker
 from src.ui.main_window import MainWindow
@@ -86,9 +91,15 @@ def main() -> int:
         access_secret=config.get("ACRCloud", "access_secret", fallback=""),
         host=config.get("ACRCloud", "host", fallback="identify-eu-west-1.acrcloud.com"),
     )
+    llm_api = LLMAPIRecognizer(
+        base_url=config.get("LLMApi", "base_url", fallback="http://127.0.0.1:3000"),
+        api_key=config.get("API", "llm_api_key", fallback=""),
+        top_k=config.getint("LLMApi", "top_k", fallback=3),
+    )
     recognizer = MultiProviderRecognizer(
         audd=audd,
         acrcloud=acr,
+        llm_api=llm_api,
         order=config.get("Recognition", "provider_fallback_order", fallback="acrcloud,audd"),
         attempts_per_provider=config.getint("Recognition", "provider_attempts", fallback=2),
     )

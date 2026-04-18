@@ -15,7 +15,12 @@ CONFIG_FILE = Path(__file__).parent / "config.ini"
 _DEFAULTS: dict[str, dict[str, str]] = {
     "API": {
         "audd_api_key": "",
+        "llm_api_key": "",
         "musixmatch_api_key": "",
+    },
+    "LLMApi": {
+        "base_url": "http://127.0.0.1:3000",
+        "top_k": "3",
     },
     "ACRCloud": {
         "access_key": "",
@@ -25,13 +30,17 @@ _DEFAULTS: dict[str, dict[str, str]] = {
     "Audio": {
         "capture_device_index": "-1",
         "capture_device_name": "",
-        "target_sample_rate": "44100",
-        "max_normalize_gain": "2.0",
+        "target_sample_rate": "0",
+        "max_normalize_gain": "1.3",
     },
     "Recognition": {
         "recognition_provider": "audd",
         "provider_fallback_order": "acrcloud,audd",
         "provider_attempts": "2",
+        "save_audio_for_training": "false",
+        "training_audio_same_song_cooldown_s": "90",
+        "new_song_max_attempts": "12",
+        "new_song_attempt_cooldown_s": "120",
         "capture_duration": "5",
         "recognition_interval": "2",
         "silence_threshold": "100",

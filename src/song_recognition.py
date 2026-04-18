@@ -481,6 +481,176 @@ class ACRCloudRecognizer:
             pass
 
 
+class LLMAPIRecognizer:
+    """Identifies songs using the local llm-music-api service."""
+
+    TIMEOUT_S = 8
+    CONNECT_TIMEOUT_S = 3
+    INDEX_NOT_TRAINED_PAUSE_S = 15 * 60
+    PAYLOAD_TOO_LARGE_PAUSE_S = 10 * 60
+
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:3000",
+        api_key: str = "",
+        top_k: int = 3,
+    ) -> None:
+        self.base_url = (base_url or "http://127.0.0.1:3000").strip().rstrip("/")
+        self.api_key = (api_key or "").strip()
+        self.top_k = max(1, int(top_k or 3))
+        self._session = AudDRecognizer._create_optimized_session()
+
+    @property
+    def _endpoint(self) -> str:
+        return f"{self.base_url}/identify/audio"
+
+    @staticmethod
+    def _safe_int(value) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _safe_float(value) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _is_index_not_trained_message(message: str) -> bool:
+        normalized = (message or "").strip().lower()
+        return (
+            "index de audio" in normalized
+            and "nao treinado" in normalized
+        )
+
+    def recognize(
+        self, audio_bytes: bytes, capture_start_time: float
+    ) -> Tuple[Optional[SongInfo], float]:
+        if not self.base_url:
+            raise RecognitionError(
+                "LLM API não configurada. Defina a URL base em Configurações."
+            )
+
+        # Salvar áudio para debug se configurado
+        _save_debug_audio(audio_bytes, provider_name="llm_api")
+
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        payload = {
+            "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+            "top_k": self.top_k,
+        }
+
+        try:
+            resp = self._session.post(
+                self._endpoint,
+                json=payload,
+                headers=headers,
+                timeout=(self.CONNECT_TIMEOUT_S, self.TIMEOUT_S),
+            )
+            resp.raise_for_status()
+        except requests.Timeout:
+            _LOG.warning("LLM API timeout")
+            raise RecognitionError("Timeout ao conectar na LLM API.")
+        except requests.ConnectionError:
+            _LOG.warning("LLM API sem conexão")
+            raise RecognitionError(
+                "LLM API indisponível. Verifique se o serviço está rodando."
+            )
+        except requests.HTTPError as exc:
+            _LOG.error("LLM API HTTP %s", exc.response.status_code)
+            if exc.response is not None:
+                status_code = exc.response.status_code
+                body_message = ""
+                try:
+                    parsed_error = _json.loads(exc.response.content.decode("utf-8"))
+                    if isinstance(parsed_error, dict):
+                        body_message = (
+                            parsed_error.get("message")
+                            or parsed_error.get("error")
+                            or ""
+                        )
+                except Exception:
+                    body_message = ""
+
+                if status_code == 413:
+                    raise RateLimitError(
+                        "LLM API rejeitou payload grande (HTTP 413). Pausando provedor temporariamente.",
+                        seconds_left=self.PAYLOAD_TOO_LARGE_PAUSE_S,
+                    ) from exc
+
+                if (
+                    status_code == 400
+                    and self._is_index_not_trained_message(body_message)
+                ):
+                    raise RateLimitError(
+                        "Index de áudio do LLM não treinado. Execute /recognition/train. Pausando provedor temporariamente.",
+                        seconds_left=self.INDEX_NOT_TRAINED_PAUSE_S,
+                    ) from exc
+
+            raise RecognitionError(
+                f"Erro HTTP {exc.response.status_code} da LLM API."
+            ) from exc
+
+        try:
+            parsed = _json.loads(resp.content.decode("utf-8"))
+        except ValueError:
+            raise RecognitionError("Resposta inesperada da LLM API (não é JSON).")
+
+        if isinstance(parsed, dict) and parsed.get("success") is False:
+            message = parsed.get("message") or parsed.get("error") or "Erro desconhecido"
+            if self._is_index_not_trained_message(message):
+                raise RateLimitError(
+                    "Index de áudio do LLM não treinado. Execute /recognition/train. Pausando provedor temporariamente.",
+                    seconds_left=self.INDEX_NOT_TRAINED_PAUSE_S,
+                )
+            raise RecognitionError(f"LLM API: {message}")
+
+        song = self._parse(parsed)
+        return song, capture_start_time
+
+    def _parse(self, payload: dict) -> Optional[SongInfo]:
+        if not isinstance(payload, dict):
+            raise RecognitionError("Resposta inesperada da LLM API.")
+
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        title = (data.get("song") or data.get("title") or "").strip()
+        if not title:
+            return None
+
+        artist = (data.get("artist") or "").strip()
+        album = (data.get("album") or "").strip()
+        duration_s = self._safe_int(
+            data.get("duration_s")
+            or data.get("duration")
+            or (data.get("metadata") or {}).get("duration_s")
+        )
+        timecode_ms = self._safe_int(data.get("timecode_ms") or data.get("timecode"))
+        confidence = self._safe_float(data.get("confidence"))
+
+        return SongInfo(
+            title=title,
+            artist=artist,
+            album=album,
+            duration_s=duration_s,
+            confidence=confidence,
+            timecode_ms=max(0, timecode_ms),
+        )
+
+    def __del__(self) -> None:
+        try:
+            self._session.close()
+        except Exception:
+            pass
+
+
 class MultiProviderRecognizer:
     """
     Tries multiple recognition providers in alternating rounds.
@@ -493,11 +663,13 @@ class MultiProviderRecognizer:
         self,
         audd: AudDRecognizer,
         acrcloud: ACRCloudRecognizer,
+        llm_api: Optional[LLMAPIRecognizer] = None,
         order: str = "acrcloud,audd",
         attempts_per_provider: int = 2,
     ) -> None:
         self.audd = audd
         self.acrcloud = acrcloud
+        self.llm_api = llm_api or LLMAPIRecognizer()
         self._order = self._parse_order(order)
         self._attempts_per_provider = max(1, int(attempts_per_provider or 2))
         self._fresh_capture_callback = None  # Callback para capturar áudio fresco
@@ -508,11 +680,13 @@ class MultiProviderRecognizer:
 
     @staticmethod
     def _parse_order(order: str) -> list[str]:
+        allowed = {"acrcloud", "audd", "llm_api"}
         raw = [p.strip().lower() for p in (order or "").split(",") if p.strip()]
-        filtered = [p for p in raw if p in ("acrcloud", "audd")]
-        if len(filtered) != 2:
-            return ["acrcloud", "audd"]
-        if filtered[0] == filtered[1]:
+        filtered: list[str] = []
+        for provider in raw:
+            if provider in allowed and provider not in filtered:
+                filtered.append(provider)
+        if not filtered:
             return ["acrcloud", "audd"]
         return filtered
 
@@ -651,15 +825,23 @@ class MultiProviderRecognizer:
         acr_access_key: str,
         acr_access_secret: str,
         acr_host: str,
+        llm_base_url: str = "",
+        llm_api_key: str = "",
+        llm_top_k: int = 3,
     ) -> None:
         self.audd.api_key = (audd_api_key or "").strip()
         self.acrcloud.access_key = (acr_access_key or "").strip()
         self.acrcloud.access_secret = (acr_access_secret or "").strip()
         self.acrcloud.host = (acr_host or "").strip().rstrip("/")
+        self.llm_api.base_url = (llm_base_url or "http://127.0.0.1:3000").strip().rstrip("/")
+        self.llm_api.api_key = (llm_api_key or "").strip()
+        self.llm_api.top_k = max(1, int(llm_top_k or 3))
 
     def _provider_obj(self, name: str):
         if name == "audd":
             return self.audd
+        if name == "llm_api":
+            return self.llm_api
         return self.acrcloud
 
     def _run_single_attempt(

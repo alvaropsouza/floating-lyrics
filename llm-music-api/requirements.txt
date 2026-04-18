@@ -12,3 +12,9 @@ fastapi>=0.109.0
 uvicorn>=0.27.0
 pydantic>=2.6.0
 ollama>=0.1.0
+
+# Reconhecimento por trecho de audio (treino + similaridade)
+numpy>=1.26.0
+scipy>=1.11.0
+librosa>=0.10.2
+soundfile>=0.12.1

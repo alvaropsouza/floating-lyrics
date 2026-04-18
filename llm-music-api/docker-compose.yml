@@ -1,55 +1,71 @@
-version: '3.8'
-
 services:
+  model-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llm-music-model-server
+    command: [ "python3", "src/model_server.py" ]
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./training_audio:/app/training_audio
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MODEL_PATH=/app/models/mistral-7b-music-lora
+      - MODEL_SERVER_PORT=8000
+      - MODEL_DTYPE=bfloat16
+      - MODEL_ENABLE_GENERATION=false
+      - AUDIO_INDEX_PATH=/app/models/audio_index.npz
+      - AUDIO_DATASET_PATH=/app/training_audio
+      - MAX_LENGTH=512
+      - TEMPERATURE=0.7
+      - TOP_P=0.95
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    mem_limit: 16g
+    mem_reservation: 8g
+    cpus: 4
+
   llm-music-api:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: llm-music-api
+    command: [ "node", "src/server.js" ]
+    depends_on:
+      model-server:
+        condition: service_healthy
     ports:
       - "3000:3000"
     volumes:
-      # Volume para modelos pré-treinados (coloque seus modelos aqui)
       - ./models:/app/models
-      # Volume para logs (opcional)
       - ./logs:/app/logs
-      # Para desenvolvimento: descomentar para hot-reload
-      # - ./src:/app/src
+      - ./training_audio:/app/training_audio
     environment:
       - NODE_ENV=production
       - PORT=3000
       - HOST=0.0.0.0
-      # Configurações do modelo
-      - MODEL_NAME=mistralai/Mistral-7B-Instruct-v0.2
-      - MODEL_PATH=/app/models/mistral-7b-music-lora
-      - USE_LORA=true
-      - LORA_WEIGHTS_PATH=/app/models/lora-weights
+      - MODEL_SERVER=http://model-server:8000
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=phi3
+      - AUDIO_DATASET_PATH=/app/training_audio
       - MAX_LENGTH=512
       - TEMPERATURE=0.7
       - TOP_P=0.95
-      # Hardware (ajustar conforme disponibilidade)
-      - USE_GPU=false
-      - DEVICE=cpu
-      - LOAD_IN_8BIT=true
-    # Para usar GPU, descomentar e configurar
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:3000/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 60s
-    # Limites de recursos
-    mem_limit: 16g
-    mem_reservation: 8g
-    cpus: 4
 
 networks:
   default:

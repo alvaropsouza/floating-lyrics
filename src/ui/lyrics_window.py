@@ -344,6 +344,9 @@ class LyricsWindow(QWidget):
                 acr_access_key=self._config.get("ACRCloud", "access_key", fallback=""),
                 acr_access_secret=self._config.get("ACRCloud", "access_secret", fallback=""),
                 acr_host=self._config.get("ACRCloud", "host", fallback="identify-eu-west-1.acrcloud.com"),
+                llm_base_url=self._config.get("LLMApi", "base_url", fallback="http://127.0.0.1:3000"),
+                llm_api_key=self._config.get("API", "llm_api_key", fallback=""),
+                llm_top_k=self._config.getint("LLMApi", "top_k", fallback=3),
             )
             rec.configure_fallback(
                 self._config.get("Recognition", "provider_fallback_order", fallback="acrcloud,audd"),

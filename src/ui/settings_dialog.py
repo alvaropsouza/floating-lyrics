@@ -114,13 +114,19 @@ class SettingsDialog(QDialog):
         self._combo_provider = QComboBox()
         self._combo_provider.addItem("AudD", "audd")
         self._combo_provider.addItem("ACRCloud", "acrcloud")
+        self._combo_provider.addItem("LLM API", "llm_api")
         current_provider = self._config.get("Recognition", "recognition_provider", fallback="audd").strip().lower()
-        self._combo_provider.setCurrentIndex(0 if current_provider != "acrcloud" else 1)
+        provider_idx = self._combo_provider.findData(current_provider)
+        self._combo_provider.setCurrentIndex(0 if provider_idx < 0 else provider_idx)
         fl.addRow("Provedor:", self._combo_provider)
 
         self._combo_fallback = QComboBox()
         self._combo_fallback.addItem("ACRCloud → AudD", "acrcloud,audd")
         self._combo_fallback.addItem("AudD → ACRCloud", "audd,acrcloud")
+        self._combo_fallback.addItem("LLM API → ACRCloud → AudD", "llm_api,acrcloud,audd")
+        self._combo_fallback.addItem("LLM API → AudD → ACRCloud", "llm_api,audd,acrcloud")
+        self._combo_fallback.addItem("ACRCloud → LLM API → AudD", "acrcloud,llm_api,audd")
+        self._combo_fallback.addItem("AudD → LLM API → ACRCloud", "audd,llm_api,acrcloud")
         fallback_order = self._config.get(
             "Recognition", "provider_fallback_order", fallback="acrcloud,audd"
         ).strip().lower()
@@ -185,6 +191,36 @@ class SettingsDialog(QDialog):
         fl.addRow(*self._row_acr_host)
         fl.addRow(*self._row_acr_link)
 
+        # ── LLM API fields ──────────────────────────────────────────────────
+        self._edit_llm_base = QLineEdit()
+        self._edit_llm_base.setPlaceholderText("http://127.0.0.1:3000")
+        self._edit_llm_base.setText(
+            self._config.get("LLMApi", "base_url", fallback="http://127.0.0.1:3000")
+        )
+
+        self._edit_llm_key = QLineEdit()
+        self._edit_llm_key.setPlaceholderText("Bearer token (opcional)")
+        self._edit_llm_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._edit_llm_key.setText(self._config.get("API", "llm_api_key", fallback=""))
+
+        self._spin_llm_top_k = QSpinBox()
+        self._spin_llm_top_k.setRange(1, 10)
+        self._spin_llm_top_k.setValue(self._config.getint("LLMApi", "top_k", fallback=3))
+        self._spin_llm_top_k.setSuffix(" candidatos")
+
+        lnk_llm = QLabel(
+            '<span style="color:#8899FF;">Endpoint esperado: POST /identify/audio</span>'
+        )
+
+        self._row_llm_base = (QLabel("LLM API URL:"), self._edit_llm_base)
+        self._row_llm_key = (QLabel("LLM API Key:"), self._edit_llm_key)
+        self._row_llm_top_k = (QLabel("Top-K:"), self._spin_llm_top_k)
+        self._row_llm_hint = (QLabel(""), lnk_llm)
+        fl.addRow(*self._row_llm_base)
+        fl.addRow(*self._row_llm_key)
+        fl.addRow(*self._row_llm_top_k)
+        fl.addRow(*self._row_llm_hint)
+
         # ── Musixmatch ───────────────────────────────────────────────────────
         self._edit_mx = QLineEdit()
         self._edit_mx.setPlaceholderText("Musixmatch (opcional — fallback de letras simples)")
@@ -207,13 +243,19 @@ class SettingsDialog(QDialog):
         return grp
 
     def _update_provider_visibility(self) -> None:
-        is_audd = self._combo_provider.currentData() != "acrcloud"
+        provider = self._combo_provider.currentData()
+        is_audd = provider == "audd"
+        is_acr = provider == "acrcloud"
+        is_llm = provider == "llm_api"
         for lbl, widget in (self._row_audd_key, self._row_audd_link):
             lbl.setVisible(is_audd)
             widget.setVisible(is_audd)
         for lbl, widget in (self._row_acr_key, self._row_acr_secret, self._row_acr_host, self._row_acr_link):
-            lbl.setVisible(not is_audd)
-            widget.setVisible(not is_audd)
+            lbl.setVisible(is_acr)
+            widget.setVisible(is_acr)
+        for lbl, widget in (self._row_llm_base, self._row_llm_key, self._row_llm_top_k, self._row_llm_hint):
+            lbl.setVisible(is_llm)
+            widget.setVisible(is_llm)
 
     def _build_display_group(self) -> QGroupBox:
         grp = QGroupBox("Exibição")
@@ -279,26 +321,41 @@ class SettingsDialog(QDialog):
         self._config.set("Recognition", "provider_fallback_order", fallback_order)
         self._config.set("Recognition", "provider_attempts", provider_attempts)
         self._config.set("API", "audd_api_key",       self._edit_audd.text().strip())
+        self._config.set("API", "llm_api_key",        self._edit_llm_key.text().strip())
         self._config.set("API", "musixmatch_api_key", self._edit_mx.text().strip())
         self._config.set("ACRCloud", "access_key",    self._edit_acr_key.text().strip())
         self._config.set("ACRCloud", "access_secret", self._edit_acr_secret.text().strip())
         self._config.set("ACRCloud", "host",          self._edit_acr_host.text().strip())
+        self._config.set("LLMApi", "base_url",        self._edit_llm_base.text().strip())
+        self._config.set("LLMApi", "top_k",           self._spin_llm_top_k.value())
         self._config.save()
         # Update running recognizer credentials (no restart needed for same provider).
         rec = self._worker.recognizer
-        from src.song_recognition import AudDRecognizer, ACRCloudRecognizer, MultiProviderRecognizer
+        from src.song_recognition import (
+            ACRCloudRecognizer,
+            AudDRecognizer,
+            LLMAPIRecognizer,
+            MultiProviderRecognizer,
+        )
         if isinstance(rec, AudDRecognizer):
             rec.api_key = self._edit_audd.text().strip()
         elif isinstance(rec, ACRCloudRecognizer):
             rec.access_key    = self._edit_acr_key.text().strip()
             rec.access_secret = self._edit_acr_secret.text().strip()
             rec.host          = self._edit_acr_host.text().strip()
+        elif isinstance(rec, LLMAPIRecognizer):
+            rec.base_url = self._edit_llm_base.text().strip().rstrip("/")
+            rec.api_key = self._edit_llm_key.text().strip()
+            rec.top_k = self._spin_llm_top_k.value()
         elif isinstance(rec, MultiProviderRecognizer):
             rec.update_credentials(
                 self._edit_audd.text().strip(),
                 self._edit_acr_key.text().strip(),
                 self._edit_acr_secret.text().strip(),
                 self._edit_acr_host.text().strip(),
+                self._edit_llm_base.text().strip(),
+                self._edit_llm_key.text().strip(),
+                self._spin_llm_top_k.value(),
             )
             rec.configure_fallback(fallback_order, provider_attempts)
         self._btn_save_api.setText("Salvo ✓")

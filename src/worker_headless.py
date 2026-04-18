@@ -7,9 +7,12 @@ Roda em thread separada e usa callbacks ao invés de Qt signals.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, Future
+from pathlib import Path
 from typing import Callable, Any
 
 from src.song_recognition import RateLimitError
@@ -94,9 +97,54 @@ class RecognitionWorkerHeadless(threading.Thread):
         # Rastreamento de mudanças rápidas
         self._min_recognition_interval_s = 2.0  # Se confidence for baixa, reconhecer novamente em 2s
         self._last_full_recognition_time: float = 0.0
+        self._last_training_save_by_song: dict[tuple[str, str, str], float] = {}
+        self._new_song_attempts: int = 0
+        self._new_song_cooldown_until: float = 0.0
         
         # Configurar callback de captura fresca no recognizer
         self._recognizer.set_fresh_capture_callback(self._capture_fresh_audio)
+
+    @staticmethod
+    def _sanitize_part(value: str, fallback: str) -> str:
+        raw = (value or "").strip()
+        if not raw:
+            return fallback
+        normalized = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
+        normalized = normalized.lower()
+        normalized = re.sub(r"\s+", "-", normalized)
+        normalized = re.sub(r"[^a-z0-9._-]", "", normalized)
+        normalized = normalized.strip("-._")
+        return normalized or fallback
+
+    def _save_training_audio_if_needed(self, result, song_key: tuple[str, str, str], audio_bytes: bytes) -> None:
+        if not self._config.getboolean("Recognition", "save_audio_for_training", fallback=False):
+            return
+
+        cooldown_s = max(
+            0,
+            self._config.getint("Recognition", "training_audio_same_song_cooldown_s", fallback=90),
+        )
+        now = time.time()
+        last = self._last_training_save_by_song.get(song_key, 0.0)
+        if cooldown_s > 0 and (now - last) < cooldown_s:
+            return
+
+        artist = self._sanitize_part(result.artist, "unknown-artist")
+        title = self._sanitize_part(result.title, "unknown-title")
+        album = self._sanitize_part(result.album or "", "unknown-album")
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
+        filename = f"{artist}__{title}__{album}__{stamp}.wav"
+
+        target_dir = Path(__file__).resolve().parent.parent / "llm-music-api" / "training_audio"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / filename
+
+        try:
+            target_path.write_bytes(audio_bytes)
+            self._last_training_save_by_song[song_key] = now
+            _LOG.info("🎓 Trecho salvo para treino: %s", target_path.name)
+        except Exception as exc:
+            _LOG.warning("Falha ao salvar trecho para treino: %s", exc)
 
     # ── Event callbacks ─────────────────────────────────────────────────────
 
@@ -271,7 +319,7 @@ class RecognitionWorkerHeadless(threading.Thread):
         """
         _LOG.debug("Capturando trecho fresco de áudio...")
         capture_start = time.perf_counter()
-        duration = self._config.getint("Capture", "capture_duration", fallback=10)
+        duration = self._config.getint("Recognition", "capture_duration", fallback=10)
         audio_data = self._audio.capture(duration)
         return audio_data, capture_start
 
@@ -287,9 +335,49 @@ class RecognitionWorkerHeadless(threading.Thread):
         else:
             return self._config.getfloat("Recognition", "tracking_interval", fallback=30.0)
 
+    def _new_song_limit_reached(self) -> bool:
+        if self._current_song_key is not None:
+            return False
+        now = time.monotonic()
+        if now >= self._new_song_cooldown_until:
+            return False
+        remaining = int(self._new_song_cooldown_until - now)
+        mins, secs = divmod(max(0, remaining), 60)
+        self._emit('status_changed', f"⏳ Limite para nova música atingido — retomando em {mins}m{secs:02d}s")
+        return True
+
+    def _register_new_song_miss(self) -> None:
+        if self._current_song_key is not None:
+            return
+        max_attempts = max(
+            1,
+            self._config.getint("Recognition", "new_song_max_attempts", fallback=12),
+        )
+        cooldown_s = max(
+            0,
+            self._config.getint("Recognition", "new_song_attempt_cooldown_s", fallback=120),
+        )
+        self._new_song_attempts += 1
+        if self._new_song_attempts < max_attempts:
+            return
+
+        self._new_song_attempts = 0
+        if cooldown_s <= 0:
+            return
+
+        self._new_song_cooldown_until = time.monotonic() + cooldown_s
+        _LOG.warning(
+            "Limite de tentativas para nova música atingido (%d). Pausando por %ds.",
+            max_attempts,
+            cooldown_s,
+        )
+
     def _cycle(self) -> None:
         """Single recognition cycle."""
         start_time = time.perf_counter()
+
+        if self._new_song_limit_reached():
+            return
         
         # Check rate limit
         now = time.perf_counter()
@@ -305,7 +393,7 @@ class RecognitionWorkerHeadless(threading.Thread):
         # Capture audio
         try:
             capture_start = time.perf_counter()
-            duration = self._config.getint("Capture", "capture_duration", fallback=10)
+            duration = self._config.getint("Recognition", "capture_duration", fallback=10)
             audio_data = self._audio.capture(duration)
             if audio_data is None or len(audio_data) == 0:
                 _LOG.debug("No audio captured")
@@ -329,7 +417,7 @@ class RecognitionWorkerHeadless(threading.Thread):
             _LOG.debug(f"{elapsed:.1f}s | encontrado={found}")
             
             if found and result:
-                self._handle_song_found(result, updated_capture_start)
+                self._handle_song_found(result, updated_capture_start, audio_data)
             else:
                 self._handle_song_not_found()
                 
@@ -409,7 +497,7 @@ class RecognitionWorkerHeadless(threading.Thread):
         
         return False  # Aceitar resultado
 
-    def _handle_song_found(self, result, capture_start: float) -> None:
+    def _handle_song_found(self, result, capture_start: float, audio_bytes: bytes) -> None:
         """Processa resultado quando música é encontrada."""
         song_key = (result.title, result.artist, result.album or "")
         self._last_recognition_time = time.perf_counter()
@@ -418,6 +506,8 @@ class RecognitionWorkerHeadless(threading.Thread):
         # Verificar se confiança indica mudança de música
         if self._check_confidence_for_song_change(result):
             return  # Ignorar este reconhecimento
+
+        self._save_training_audio_if_needed(result, song_key, audio_bytes)
         
         # Emit song found
         self._emit('song_found', result.title, result.artist, result.album or "")
@@ -438,12 +528,16 @@ class RecognitionWorkerHeadless(threading.Thread):
                 
                 self._emit('timecode_updated', compensated_timecode, capture_start)
             self._miss_streak = 0
+            self._new_song_attempts = 0
+            self._new_song_cooldown_until = 0.0
             return
         
         # New song detected
         _LOG.info(f"Nova música: {result.title} - {result.artist} (confiança={result.confidence:.1%})")
         self._current_song_key = song_key
         self._miss_streak = 0
+        self._new_song_attempts = 0
+        self._new_song_cooldown_until = 0.0
         self._low_confidence_count = 0  # Reset quando muda de música com sucesso
         
         # Fetch and emit lyrics
@@ -551,6 +645,7 @@ class RecognitionWorkerHeadless(threading.Thread):
 
     def _handle_song_not_found(self) -> None:
         """Processa resultado quando música não é encontrada."""
+        self._register_new_song_miss()
         self._miss_streak += 1
         self._last_confidence = None  # Reset confiança
         

@@ -32,7 +32,12 @@ _LOG = logging.getLogger(__name__)
 from config import Config
 from src.audio_capture import AudioCapture
 from src.lyrics_fetcher import LyricsFetcher
-from src.song_recognition import AudDRecognizer, ACRCloudRecognizer, MultiProviderRecognizer
+from src.song_recognition import (
+    ACRCloudRecognizer,
+    AudDRecognizer,
+    LLMAPIRecognizer,
+    MultiProviderRecognizer,
+)
 from src.websocket_bridge import WebSocketBridge
 from src.websocket_server import get_server
 from src.worker import RecognitionWorker
@@ -72,9 +77,15 @@ class BackendServer:
             access_secret=self.config.get("ACRCloud", "access_secret", fallback=""),
             host=self.config.get("ACRCloud", "host", fallback="identify-eu-west-1.acrcloud.com"),
         )
+        llm_api = LLMAPIRecognizer(
+            base_url=self.config.get("LLMApi", "base_url", fallback="http://127.0.0.1:3000"),
+            api_key=self.config.get("API", "llm_api_key", fallback=""),
+            top_k=self.config.getint("LLMApi", "top_k", fallback=3),
+        )
         recognizer = MultiProviderRecognizer(
             audd=audd,
             acrcloud=acr,
+            llm_api=llm_api,
             order=self.config.get("Recognition", "provider_fallback_order", fallback="acrcloud,audd"),
             attempts_per_provider=self.config.getint("Recognition", "provider_attempts", fallback=2),
         )
