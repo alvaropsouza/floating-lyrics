@@ -729,6 +729,73 @@ class LLMAPITrainer:
             pass
 
 
+class LLMSearchClient:
+    """Busca metadados + letras via endpoint /search da llm-music-api.
+
+    Recebe apenas um título e retorna artista, álbum, letras e confiança.
+    """
+
+    TIMEOUT_S = 30
+    CONNECT_TIMEOUT_S = 3
+
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:3000",
+    ) -> None:
+        self.base_url = (base_url or "http://127.0.0.1:3000").strip().rstrip("/")
+        self._session = AudDRecognizer._create_optimized_session()
+
+    @property
+    def _endpoint(self) -> str:
+        return f"{self.base_url}/search"
+
+    def search(self, title: str) -> Optional[dict[str, Any]]:
+        """Envia título e recebe metadados + letras da LLM API.
+
+        Returns dict com chaves: title, artist, album, lyrics, synced, confidence, sources
+        ou None se falhou.
+        """
+        if not title or not title.strip():
+            return None
+
+        try:
+            resp = self._session.post(
+                self._endpoint,
+                json={"title": title.strip()},
+                timeout=(self.CONNECT_TIMEOUT_S, self.TIMEOUT_S),
+            )
+            resp.raise_for_status()
+        except requests.Timeout:
+            _LOG.warning("LLM /search timeout")
+            return None
+        except requests.ConnectionError:
+            _LOG.debug("LLM /search indisponível")
+            return None
+        except requests.HTTPError as exc:
+            _LOG.warning("LLM /search HTTP %s", exc.response.status_code if exc.response else "?")
+            return None
+
+        try:
+            parsed = _json.loads(resp.content.decode("utf-8"))
+        except ValueError:
+            return None
+
+        if not isinstance(parsed, dict) or not parsed.get("success"):
+            return None
+
+        data = parsed.get("data")
+        if not isinstance(data, dict):
+            return None
+
+        return data
+
+    def __del__(self) -> None:
+        try:
+            self._session.close()
+        except Exception:
+            pass
+
+
 class MultiProviderRecognizer:
     """
     Tries multiple recognition providers in alternating rounds.

@@ -98,18 +98,33 @@ class AudioMatcher:
         )
 
     def _parse_meta_from_path(self, file_path: str) -> Dict[str, str]:
-        # Formato preferido: artist__title__album.ext
+        # Formato legado: artist__title__album.ext
         name = os.path.splitext(os.path.basename(file_path))[0]
         parts = name.split("__")
 
-        if len(parts) >= 2:
+        if len(parts) >= 3:
             artist = parts[0].replace("-", " ").strip()
             title = parts[1].replace("-", " ").strip()
             album = parts[2].replace("-", " ").strip() if len(parts) > 2 else ""
             return {"artist": artist, "title": title, "album": album}
 
-        # Fallback: usa pasta como artista e arquivo como titulo
+        # Formato recomendado:
+        # training_audio/{artist}/{album}/{title}__{timestamp}.wav
         parent = os.path.basename(os.path.dirname(file_path)).strip()
+        grandparent = os.path.basename(os.path.dirname(os.path.dirname(file_path))).strip()
+        if grandparent and parent:
+            title = parts[0].replace("-", " ").strip() if parts else name.strip()
+            artist = grandparent.replace("-", " ").strip()
+            album = parent.replace("-", " ").strip()
+            return {"artist": artist, "title": title, "album": album}
+
+        # Compatibilidade: artist__title.ext (sem album)
+        if len(parts) >= 2:
+            artist = parts[0].replace("-", " ").strip()
+            title = parts[1].replace("-", " ").strip()
+            return {"artist": artist, "title": title, "album": ""}
+
+        # Fallback final
         return {"artist": parent or "Unknown", "title": name.strip(), "album": ""}
 
     def _to_mono_float32(self, signal: np.ndarray) -> np.ndarray:

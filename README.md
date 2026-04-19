@@ -32,6 +32,18 @@ No `bash`/Git Bash:
 ./start_all.sh
 ```
 
+Para subir sem frontend Flutter:
+
+```bash
+./start_all.sh --no-front
+```
+
+No Windows CMD/PowerShell:
+
+```bat
+start_all.bat --no-front
+```
+
 `start_all.bat` abre 3 janelas separadas no Windows. `start_all.sh` sobe a stack no shell atual.
 
 Ambos fazem:

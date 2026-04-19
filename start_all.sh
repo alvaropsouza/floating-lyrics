@@ -6,6 +6,17 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
 BACKEND_PID=""
+START_FRONTEND=true
+
+for arg in "$@"; do
+    case "$arg" in
+        --no-front|--no-frontend)
+            START_FRONTEND=false
+            ;;
+        *)
+            ;;
+    esac
+done
 
 cleanup() {
     if [ -n "${BACKEND_PID}" ] && kill -0 "${BACKEND_PID}" 2>/dev/null; then
@@ -50,8 +61,15 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     sleep 1
 done
 
-echo "[*] Iniciando Flutter..."
-cd "$ROOT_DIR/flutter_ui"
-flutter pub get
-flutter run -d windows
+if [ "$START_FRONTEND" = false ]; then
+    echo "[*] Modo sem frontend habilitado (--no-front)."
+    echo "[OK] API + backend headless iniciados."
+    echo "[*] Mantendo processo ativo. Pressione Ctrl+C para encerrar."
+    wait "${BACKEND_PID}"
+else
+    echo "[*] Iniciando Flutter..."
+    cd "$ROOT_DIR/flutter_ui"
+    flutter pub get
+    flutter run -d windows
+fi
 

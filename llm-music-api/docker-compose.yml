@@ -25,7 +25,7 @@ services:
     restart: unless-stopped
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:8000/health" ]
-      interval: 30s
+      interval: 120s
       timeout: 10s
       retries: 10
       start_period: 180s
@@ -42,6 +42,12 @@ services:
     depends_on:
       model-server:
         condition: service_healthy
+      ollama:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+      ollama-warmup:
+        condition: service_completed_successfully
     ports:
       - "3000:3000"
     volumes:
@@ -54,7 +60,7 @@ services:
       - HOST=0.0.0.0
       - MODEL_SERVER=http://model-server:8000
       - OLLAMA_HOST=http://ollama:11434
-      - OLLAMA_MODEL=phi3
+      - OLLAMA_MODEL=llama3.1:8b
       - AUDIO_DATASET_PATH=/app/training_audio
       - MAX_LENGTH=512
       - TEMPERATURE=0.7
@@ -62,10 +68,54 @@ services:
     restart: unless-stopped
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:3000/health" ]
-      interval: 30s
+      interval: 120s
       timeout: 10s
       retries: 3
       start_period: 60s
+
+  ollama:
+    image: ollama/ollama
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "ollama", "list" ]
+      interval: 60s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  ollama-pull:
+    image: ollama/ollama
+    container_name: ollama-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: [ "ollama", "pull", "llama3.1:8b" ]
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    restart: "no"
+
+  ollama-warmup:
+    image: ollama/ollama
+    container_name: ollama-warmup
+    depends_on:
+      ollama:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: [ "sh", "-lc", "ollama run llama3.1:8b \"warmup\" > /dev/null 2>&1" ]
+    restart: "no"
+
+volumes:
+  ollama_data:
 
 networks:
   default:

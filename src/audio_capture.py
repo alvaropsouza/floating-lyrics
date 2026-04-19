@@ -51,6 +51,7 @@ class AudioCapture:
         self._pa_spectrum: Optional[object] = None # instância SEPARADA para espectro
         self._lock = threading.RLock()             # lock exclusivo para capture()
         self._spectrum_lock = threading.Lock()     # lock exclusivo para capture_spectrum()
+        self._capture_active = threading.Event()   # evita contencao do loopback durante capture()
         self._last_spectrum: list[float] = [0.0] * 32  # Cache do último espectro
         self._spectrum_cache_hits = 0  # Contador de cache hits consecutivos
 
@@ -237,6 +238,43 @@ class AudioCapture:
             return raw_bytes
         return bytes(struct.pack(fmt, *(max(-32768, min(32767, int(s * gain))) for s in samples)))
 
+    @staticmethod
+    def _peak(raw_bytes: bytes) -> float:
+        """Compute absolute peak of 16-bit little-endian PCM samples."""
+        if not raw_bytes:
+            return 0.0
+        if _NUMPY_AVAILABLE:
+            samples = _np.frombuffer(raw_bytes, dtype="<i2").astype(_np.float32)
+            return float(_np.abs(samples).max()) if samples.size else 0.0
+        import struct
+        count = len(raw_bytes) // 2
+        shorts = struct.unpack_from(f"<{count}h", raw_bytes)
+        return float(max(abs(s) for s in shorts)) if shorts else 0.0
+
+    def _downmix_to_mono(self, raw_audio: bytes, channels: int) -> tuple[bytes, int]:
+        """Convert PCM 16-bit audio to mono for more stable fingerprinting."""
+        if not raw_audio or channels <= 1:
+            return raw_audio, 1
+        try:
+            if _NUMPY_AVAILABLE:
+                samples = _np.frombuffer(raw_audio, dtype="<i2")
+                if samples.size == 0:
+                    return raw_audio, 1
+                mono = samples.reshape(-1, channels).astype(_np.float32).mean(axis=1)
+                return _np.clip(mono, -32768, 32767).astype("<i2").tobytes(), 1
+            import struct
+            count = len(raw_audio) // 2
+            shorts = struct.unpack_from(f"<{count}h", raw_audio)
+            frames = len(shorts) // channels
+            mixed = []
+            for idx in range(frames):
+                frame = shorts[idx * channels:(idx + 1) * channels]
+                mixed.append(int(sum(frame) / max(1, len(frame))))
+            return struct.pack(f"<{len(mixed)}h", *mixed), 1
+        except Exception as exc:
+            _LOG.warning("Falha no downmix para mono: %s", exc)
+            return raw_audio, channels
+
     def _resample_if_needed(self, raw_audio: bytes, in_rate: int, channels: int) -> tuple[bytes, int]:
         """Optionally resample to a configured target rate for stable timing."""
         target_rate = self._config.getint("Audio", "target_sample_rate", fallback=44100)
@@ -287,6 +325,9 @@ class AudioCapture:
         
         Usa instância PyAudio própria (_pa_spectrum) — nunca compete com capture().
         """
+        if self._capture_active.is_set():
+            return self._last_spectrum.copy()
+
         # Lock próprio do espectro — totalmente independente do lock de capture()
         acquired = self._spectrum_lock.acquire(blocking=False)
         if not acquired:
@@ -428,7 +469,11 @@ class AudioCapture:
         """
         # Lock para evitar acesso simultâneo ao WASAPI
         with self._lock:
-            return self._capture_unsafe(duration)
+            self._capture_active.set()
+            try:
+                return self._capture_unsafe(duration)
+            finally:
+                self._capture_active.clear()
     
     def _capture_unsafe(self, duration: int) -> bytes:
         """Versão sem lock - usada internamente após adquirir lock."""
@@ -495,37 +540,43 @@ class AudioCapture:
             stream.close()
 
         raw_audio = b"".join(frames)
+        captured_channels = channels
 
         # Estimate the effective sample rate from captured byte count. Some
         # WASAPI drivers may report/open at one rate but deliver data at
         # another, which makes the WAV play accelerated/slow if the header
         # uses only the nominal rate.
+        # Keep the device sample rate in the WAV header. Estimating an
+        # "effective" rate from wall-clock time is too noisy here and can
+        # introduce audible artifacts when we resample afterward.
         effective_rate = sample_rate
-        if channels > 0:
+        if captured_channels > 0:
             bytes_per_sample = 2  # paInt16
-            total_samples = len(raw_audio) / (channels * bytes_per_sample)
+            total_samples = len(raw_audio) / (captured_channels * bytes_per_sample)
             reference_window_s = capture_elapsed_s if capture_elapsed_s > 0 else max(0.001, float(duration))
             estimated_rate = int(round(total_samples / reference_window_s))
             if 8000 <= estimated_rate <= 192000:
                 deviation = abs(estimated_rate - sample_rate) / max(sample_rate, 1)
-                if deviation >= 0.02:
+                if deviation >= 0.10:
                     _LOG.warning(
-                        "Taxa nominal=%dHz, taxa efetiva=%dHz (janela=%.3fs, desvio=%.1f%%). "
-                        "Usando taxa efetiva no WAV para evitar áudio acelerado.",
+                        "Taxa nominal=%dHz e estimada=%dHz divergiram %.1f%% (janela=%.3fs). "
+                        "Mantendo taxa nominal no WAV para evitar reamostragem incorreta.",
                         sample_rate,
                         estimated_rate,
-                        reference_window_s,
                         deviation * 100,
+                        reference_window_s,
                     )
-                    effective_rate = estimated_rate
 
         # ── Silence check (before normalization, on raw signal) ─────────────
         # Use a very low threshold here — just enough to reject true silence.
         # The actual normalization will happen next, so the API always gets
         # a loud signal regardless of system volume.
+        raw_audio, channels = self._downmix_to_mono(raw_audio, channels)
+        silence_threshold = self._config.getfloat("Recognition", "silence_threshold", fallback=30.0)
         raw_rms = self._rms(raw_audio)
+        raw_peak = self._peak(raw_audio)
         _LOG.debug("RMS do áudio bruto: %.1f", raw_rms)
-        if raw_rms < 5:
+        if raw_rms < silence_threshold and raw_peak < (silence_threshold * 4):
             raise AudioCaptureError(
                 f"Nenhum áudio detectado no sistema (RMS = {raw_rms:.1f}).\n"
                 "Verifique se algo está tocando."

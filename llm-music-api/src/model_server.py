@@ -224,18 +224,25 @@ class Handler(BaseHTTPRequestHandler):
             if json_match:
                 try:
                     result = json.loads(json_match.group(0))
+                    # Validar confiança mínima
+                    confidence = result.get('confidence', 0.0)
+                    song = (result.get('song') or '').lower()
+                    artist = (result.get('artist') or '').lower()
+                    
+                    # Se "Unknown" ou confiança muito baixa, retornar erro ao invés de confirmar
+                    if song == 'unknown' or artist == 'unknown' or confidence < 0.7:
+                        self.send_json(404, {'error': 'Song not recognized in model dataset', 'confidence': confidence})
+                        return
+                    
                     self.send_json(200, result)
                     return
                 except Exception:
                     pass
 
-            # Fallback: retornar texto bruto
-            self.send_json(200, {
-                "song": "Unknown",
-                "artist": "Unknown",
-                "album": "",
-                "lyrics": response_text,
-                "confidence": 0.5,
+            # Fallback: se não conseguiu extrair JSON ou confiança foi baixa, retornar erro
+            self.send_json(404, {
+                "error": "Could not parse model response or low confidence",
+                "confidence": 0.0,
             })
         except Exception as e:
             self.send_json(500, {"error": str(e)})

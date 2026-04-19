@@ -50,3 +50,4 @@ cache
 # Local development scripts
 *.bat.local
 *.sh.local
+llm-music-api/*cookies.txt

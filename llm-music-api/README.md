@@ -306,6 +306,46 @@ npm start
 npm run dev
 ```
 
+## 🎵 Download de Álbuns para Treino
+
+Use o script de download para salvar áudio no formato recomendado:
+
+`training_audio/{artist}/{album}/{song_file}`
+
+Exemplo básico:
+
+```bash
+python download_training_audio.py "URL_DA_PLAYLIST_OU_ALBUM"
+```
+
+Com artista/álbum fixos:
+
+```bash
+python download_training_audio.py "URL" --artist "Kendrick Lamar" --album "good kid, m.A.A.d city"
+```
+
+Somente limpeza/reorganização (sem baixar):
+
+```bash
+python download_training_audio.py --clean-only
+```
+
+Limpar também arquivos já existentes na pasta:
+
+```bash
+python download_training_audio.py --clean-existing --clean-only
+```
+
+Principais flags:
+
+- `--clean-only`: pula o download e executa só limpeza/reorganização.
+- `--clean-existing`: processa todos os arquivos já presentes no output-root.
+- `--no-llm-cleanup`: desativa chamada ao endpoint `/clean-metadata` e usa apenas heurística local/catálogo.
+- `--llm-url`: define URL do endpoint de limpeza de metadados.
+- `--llm-timeout`: timeout em segundos para limpeza via LLM.
+
+Observação: o script aplica cache em memória durante a execução para evitar chamadas LLM repetidas para os mesmos metadados.
+
 ## 🎯 Escolha do Modelo Base
 
 ### Recomendações por hardware:

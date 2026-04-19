@@ -21,5 +21,11 @@
 
 ## Repo Hygiene
 - Prefer the headless backend path for new features.
+- Keep training audio organized as `llm-music-api/training_audio/{artist}/{album}/{song_file}`.
 - Do not vendor large artifacts into git (e.g., `node_modules`, model weights, training audio).
+
+## Startup Workflow
+- Always start the full stack from the repository root using `start_all`.
+- On Windows CMD/PowerShell use `start_all.bat`; on Git Bash use `./start_all.sh`.
+- Avoid alternative startup sequences unless explicitly requested by the user.
 

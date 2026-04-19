@@ -8,5 +8,7 @@ Key rules:
 - Avoid repeated API calls for the same song; use caches where possible.
 - Keep Windows WASAPI loopback support intact.
 - Keep user-facing strings in Portuguese.
+- Keep training dataset layout as `llm-music-api/training_audio/{artist}/{album}/{song_file}`.
 - Do not add/commit real API keys or secrets.
+- Always start the full project stack from the repository root using `start_all` (`start_all.bat` on Windows CMD/PowerShell or `./start_all.sh` on Git Bash), unless the user explicitly asks for a different startup flow.
 

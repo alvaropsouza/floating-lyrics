@@ -59,6 +59,7 @@ from src.song_recognition import (
     AudDRecognizer,
     LLMAPIRecognizer,
     LLMAPITrainer,
+    LLMSearchClient,
     MultiProviderRecognizer,
 )
 from src.websocket_bridge_headless import WebSocketBridgeHeadless
@@ -143,6 +144,11 @@ class HeadlessBackendServer:
         
         lyrics = LyricsFetcher(self.config)
         
+        # Cliente /search (busca web + LLM → metadados + letras)
+        llm_search = LLMSearchClient(
+            base_url=self.config.get("LLMApi", "base_url", fallback="http://127.0.0.1:3000"),
+        )
+
         # Criar worker headless
         self.worker = RecognitionWorkerHeadless(
             self.config,
@@ -150,6 +156,7 @@ class HeadlessBackendServer:
             recognizer,
             lyrics,
             llm_trainer=llm_trainer,
+            llm_search=llm_search,
         )
         
         _LOG.info("Worker headless configurado com sucesso")
@@ -222,7 +229,7 @@ class HeadlessBackendServer:
         except asyncio.CancelledError:
             _LOG.info("\nShutdown solicitado...")
             await self.shutdown()
-            raise  # Re-raise para propagar corretamente o cancelamento
+            return
 
     async def shutdown(self) -> None:
         """Shutdown gracioso."""
@@ -260,6 +267,8 @@ class HeadlessBackendServer:
         # Rodar servidor
         try:
             asyncio.run(self.run_server())
+        except asyncio.CancelledError:
+            _LOG.info("Servidor encerrado.")
         except KeyboardInterrupt:
             _LOG.info("\nInterrompido pelo usuário")
         except RuntimeError as exc:

@@ -16,7 +16,7 @@ class WebSocketService extends ChangeNotifier {
   Song? _currentSong;
   LyricsData? _lyrics;
   int _timecodeMs = 0;
-  int? _localTimestamp;  // Timestamp local (ms) quando recebeu o timecode
+  int? _localTimestamp; // Timestamp local (ms) quando recebeu o timecode
   bool _isConnected = false;
   String? _error;
   List<double> _audioSpectrum = List.filled(32, 0.0);
@@ -30,15 +30,15 @@ class WebSocketService extends ChangeNotifier {
   bool get isConnected => _isConnected;
   String? get error => _error;
   List<double> get audioSpectrum => _audioSpectrum;
-  
+
   /// Calcula posição atual da música em tempo real
   int get currentPositionMs {
     if (_localTimestamp == null) return _timecodeMs;
-    
+
     // Tempo decorrido desde que recebemos o timecode (em ms)
     final now = DateTime.now().millisecondsSinceEpoch;
     final elapsedMs = now - _localTimestamp!;
-    
+
     // Posição = timecode inicial + tempo decorrido
     return _timecodeMs + elapsedMs;
   }
@@ -98,7 +98,8 @@ class WebSocketService extends ChangeNotifier {
           break;
 
         case 'song_not_found':
-          _status = 'Música não reconhecida';
+          _status = 'Nenhuma música tocando';
+          _currentSong = null;
           // Resetar sincronização
           _timecodeMs = 0;
           _localTimestamp = null;
@@ -108,10 +109,10 @@ class WebSocketService extends ChangeNotifier {
           final content = payload?['lyrics'] as String? ?? '';
           final synced = payload?['synced'] as bool? ?? false;
           _lyrics = LyricsData(content: content, synced: synced);
-          
+
           // Não precisa mais do capture_start_time do servidor
           // Vamos inicializar timestamp local quando receber timecode_updated
-          
+
           if (_lyrics!.lines.isEmpty) {
             debugPrint('⚠️ Letras vazias após parse (${content.length} chars)');
           }
@@ -126,15 +127,19 @@ class WebSocketService extends ChangeNotifier {
           _timecodeMs = payload?['timecode_ms'] as int? ?? 0;
           // Armazenar timestamp LOCAL quando recebemos este evento
           _localTimestamp = DateTime.now().millisecondsSinceEpoch;
-          
+
           // Debug: Log apenas na primeira vez para verificar sincronização
           if (_timecodeMs > 0) {
-            debugPrint('🎵 Timecode: ${_timecodeMs}ms (${(_timecodeMs / 1000).toStringAsFixed(1)}s)');
+            debugPrint(
+                '🎵 Timecode: ${_timecodeMs}ms (${(_timecodeMs / 1000).toStringAsFixed(1)}s)');
           }
           break;
 
         case 'error':
           _error = payload?['message'] as String?;
+          if (_error != null) {
+            _status = '⚠️ $_error';
+          }
           debugPrint('❌ Erro: $_error');
           break;
 
