@@ -53,7 +53,8 @@ echo.
 echo [*] Rodando app Flutter...
 echo.
 echo [i] Certifique-se que o backend esta rodando:
-echo     python main_server.py
+echo     python main_server_headless.py
+echo     (ou use: start_server.bat)
 echo.
 echo [i] Hot reload: Pressione R
 echo [i] Hot restart: Pressione Shift+R

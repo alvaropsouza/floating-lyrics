@@ -15,6 +15,7 @@ import io
 import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -74,6 +75,26 @@ class AudioMatcher:
             self.index_path,
             features=self._features,
             metadata_json=json.dumps(self._metadata, ensure_ascii=False),
+        )
+
+    @staticmethod
+    def _normalize_path(file_path: str) -> str:
+        return str(Path(file_path).resolve())
+
+    def _file_state(self, file_path: str) -> Dict[str, Any]:
+        stat = os.stat(file_path)
+        return {
+            "path": self._normalize_path(file_path),
+            "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+            "size": int(stat.st_size),
+        }
+
+    @staticmethod
+    def _same_file_state(meta: Dict[str, Any], file_state: Dict[str, Any]) -> bool:
+        return (
+            meta.get("path") == file_state["path"]
+            and int(meta.get("mtime_ns", -1)) == file_state["mtime_ns"]
+            and int(meta.get("size", -1)) == file_state["size"]
         )
 
     def _parse_meta_from_path(self, file_path: str) -> Dict[str, str]:
@@ -142,9 +163,27 @@ class AudioMatcher:
         if not os.path.isdir(dataset_path):
             raise ValueError(f"dataset_path nao existe: {dataset_path}")
 
+        dataset_root = self._normalize_path(dataset_path)
         vectors: List[np.ndarray] = []
         metadata: List[Dict[str, Any]] = []
         skipped = 0
+        added = 0
+        updated = 0
+        unchanged = 0
+        removed = 0
+
+        existing_by_path: Dict[str, Tuple[np.ndarray, Dict[str, Any]]] = {}
+        if self.ready and self._features is not None:
+            for idx, meta in enumerate(self._metadata):
+                path = meta.get("path")
+                if not path:
+                    continue
+                existing_by_path[self._normalize_path(path)] = (
+                    self._features[idx],
+                    meta,
+                )
+
+        current_paths: set[str] = set()
 
         for root, _dirs, files in os.walk(dataset_path):
             for name in files:
@@ -153,19 +192,37 @@ class AudioMatcher:
                     continue
 
                 file_path = os.path.join(root, name)
+                normalized_path = self._normalize_path(file_path)
+                current_paths.add(normalized_path)
                 try:
+                    file_state = self._file_state(file_path)
+                    existing = existing_by_path.get(normalized_path)
+                    if existing is not None:
+                        existing_emb, existing_meta = existing
+                        if self._same_file_state(existing_meta, file_state):
+                            vectors.append(existing_emb)
+                            metadata.append(existing_meta)
+                            unchanged += 1
+                            continue
+
                     signal, sr = self._load_audio_file(file_path)
                     emb = self._extract_embedding(signal, sr)
                     meta = self._parse_meta_from_path(file_path)
-                    meta["path"] = file_path
+                    meta.update(file_state)
 
                     vectors.append(emb)
                     metadata.append(meta)
+                    if existing is None:
+                        added += 1
+                    else:
+                        updated += 1
                 except Exception:
                     skipped += 1
 
         if not vectors:
             raise ValueError("Nenhum audio valido encontrado para treino")
+
+        removed = sum(1 for path in existing_by_path if path not in current_paths)
 
         self._features = np.vstack(vectors).astype(np.float32)
         self._metadata = metadata
@@ -175,6 +232,12 @@ class AudioMatcher:
             "trained": True,
             "items": len(metadata),
             "skipped": skipped,
+            "added": added,
+            "updated": updated,
+            "removed": removed,
+            "unchanged": unchanged,
+            "mode": "incremental",
+            "dataset_path": dataset_root,
             "index_path": self.index_path,
         }
 

@@ -58,6 +58,7 @@ from src.song_recognition import (
     ACRCloudRecognizer,
     AudDRecognizer,
     LLMAPIRecognizer,
+    LLMAPITrainer,
     MultiProviderRecognizer,
 )
 from src.websocket_bridge_headless import WebSocketBridgeHeadless
@@ -116,10 +117,21 @@ class HeadlessBackendServer:
             access_secret=self.config.get("ACRCloud", "access_secret", fallback=""),
             host=self.config.get("ACRCloud", "host", fallback="identify-eu-west-1.acrcloud.com"),
         )
-        llm_api = LLMAPIRecognizer(
+        use_llm_for_recognition = self.config.getboolean(
+            "Recognition",
+            "use_llm_for_recognition",
+            fallback=False,
+        )
+        llm_api = None
+        if use_llm_for_recognition:
+            llm_api = LLMAPIRecognizer(
+                base_url=self.config.get("LLMApi", "base_url", fallback="http://127.0.0.1:3000"),
+                api_key=self.config.get("API", "llm_api_key", fallback=""),
+                top_k=self.config.getint("LLMApi", "top_k", fallback=3),
+            )
+        llm_trainer = LLMAPITrainer(
             base_url=self.config.get("LLMApi", "base_url", fallback="http://127.0.0.1:3000"),
             api_key=self.config.get("API", "llm_api_key", fallback=""),
-            top_k=self.config.getint("LLMApi", "top_k", fallback=3),
         )
         recognizer = MultiProviderRecognizer(
             audd=audd,
@@ -136,7 +148,8 @@ class HeadlessBackendServer:
             self.config,
             audio,
             recognizer,
-            lyrics
+            lyrics,
+            llm_trainer=llm_trainer,
         )
         
         _LOG.info("Worker headless configurado com sucesso")

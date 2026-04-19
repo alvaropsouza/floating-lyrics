@@ -134,6 +134,7 @@ audio_matcher = AudioMatcher(index_path=AUDIO_INDEX_PATH)
 
 # Lock para serializar requisições (modelos não são thread-safe na inferência)
 inference_lock = threading.Lock()
+audio_index_lock = threading.Lock()
 
 
 def generate(prompt: str) -> str:
@@ -252,7 +253,8 @@ class Handler(BaseHTTPRequestHandler):
         dataset_path = payload.get("dataset_path") or AUDIO_DATASET_PATH
 
         try:
-            result = audio_matcher.train_from_folder(dataset_path)
+            with audio_index_lock:
+                result = audio_matcher.train_from_folder(dataset_path)
             self.send_json(200, result)
         except ValueError as exc:
             self.send_json(400, {"error": str(exc)})
@@ -276,7 +278,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = audio_matcher.identify_audio_base64(audio_base64, top_k=top_k)
+            with audio_index_lock:
+                result = audio_matcher.identify_audio_base64(audio_base64, top_k=top_k)
             self.send_json(200, result)
         except ValueError as exc:
             self.send_json(400, {"error": str(exc)})

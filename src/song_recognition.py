@@ -25,7 +25,7 @@ import logging
 import time as _time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import requests
 
@@ -651,6 +651,84 @@ class LLMAPIRecognizer:
             pass
 
 
+class LLMAPITrainer:
+    """Dispara o treino do índice de áudio na llm-music-api."""
+
+    TIMEOUT_S = 30
+    CONNECT_TIMEOUT_S = 3
+
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:3000",
+        api_key: str = "",
+        dataset_path: str = "/app/training_audio",
+    ) -> None:
+        self.base_url = (base_url or "http://127.0.0.1:3000").strip().rstrip("/")
+        self.api_key = (api_key or "").strip()
+        self.dataset_path = (dataset_path or "/app/training_audio").strip()
+        self._session = AudDRecognizer._create_optimized_session()
+
+    @property
+    def _endpoint(self) -> str:
+        return f"{self.base_url}/recognition/train"
+
+    def trigger_training(self, dataset_path: Optional[str] = None) -> dict[str, Any]:
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        payload: dict[str, str] = {}
+        effective_dataset_path = (dataset_path or self.dataset_path).strip()
+        if effective_dataset_path:
+            payload["dataset_path"] = effective_dataset_path
+
+        try:
+            resp = self._session.post(
+                self._endpoint,
+                json=payload,
+                headers=headers,
+                timeout=(self.CONNECT_TIMEOUT_S, self.TIMEOUT_S),
+            )
+            resp.raise_for_status()
+        except requests.Timeout as exc:
+            raise RecognitionError("Timeout ao disparar treino da LLM API.") from exc
+        except requests.ConnectionError as exc:
+            raise RecognitionError("Sem conexão com a LLM API para treino.") from exc
+        except requests.HTTPError as exc:
+            try:
+                parsed = _json.loads(exc.response.content.decode("utf-8"))
+                message = parsed.get("message") or parsed.get("error") or ""
+            except Exception:
+                message = ""
+            detail = f": {message}" if message else ""
+            raise RecognitionError(
+                f"Erro HTTP {exc.response.status_code} ao treinar LLM API{detail}"
+            ) from exc
+
+        try:
+            parsed = _json.loads(resp.content.decode("utf-8"))
+        except ValueError as exc:
+            raise RecognitionError("Resposta inesperada da rota de treino da LLM API.") from exc
+
+        if isinstance(parsed, dict) and parsed.get("success") is False:
+            message = parsed.get("message") or parsed.get("error") or "Erro desconhecido"
+            raise RecognitionError(f"Falha no treino da LLM API: {message}")
+
+        if isinstance(parsed, dict):
+            data = parsed.get("data")
+            if isinstance(data, dict):
+                return data
+            return parsed
+
+        raise RecognitionError("Resposta inesperada da rota de treino da LLM API.")
+
+    def __del__(self) -> None:
+        try:
+            self._session.close()
+        except Exception:
+            pass
+
+
 class MultiProviderRecognizer:
     """
     Tries multiple recognition providers in alternating rounds.
@@ -669,8 +747,8 @@ class MultiProviderRecognizer:
     ) -> None:
         self.audd = audd
         self.acrcloud = acrcloud
-        self.llm_api = llm_api or LLMAPIRecognizer()
-        self._order = self._parse_order(order)
+        self.llm_api = llm_api
+        self._order = self._parse_order(order, include_llm=self.llm_api is not None)
         self._attempts_per_provider = max(1, int(attempts_per_provider or 2))
         self._fresh_capture_callback = None  # Callback para capturar áudio fresco
         self._suspended_until: dict[str, float] = {}  # {provider_name: timestamp}
@@ -679,8 +757,10 @@ class MultiProviderRecognizer:
         self._load_suspensions()
 
     @staticmethod
-    def _parse_order(order: str) -> list[str]:
-        allowed = {"acrcloud", "audd", "llm_api"}
+    def _parse_order(order: str, include_llm: bool = True) -> list[str]:
+        allowed = {"acrcloud", "audd"}
+        if include_llm:
+            allowed.add("llm_api")
         raw = [p.strip().lower() for p in (order or "").split(",") if p.strip()]
         filtered: list[str] = []
         for provider in raw:
@@ -691,7 +771,7 @@ class MultiProviderRecognizer:
         return filtered
 
     def configure_fallback(self, order: str, attempts_per_provider: int) -> None:
-        self._order = self._parse_order(order)
+        self._order = self._parse_order(order, include_llm=self.llm_api is not None)
         self._attempts_per_provider = max(1, int(attempts_per_provider or 2))
 
     def set_fresh_capture_callback(self, callback) -> None:
@@ -833,14 +913,17 @@ class MultiProviderRecognizer:
         self.acrcloud.access_key = (acr_access_key or "").strip()
         self.acrcloud.access_secret = (acr_access_secret or "").strip()
         self.acrcloud.host = (acr_host or "").strip().rstrip("/")
-        self.llm_api.base_url = (llm_base_url or "http://127.0.0.1:3000").strip().rstrip("/")
-        self.llm_api.api_key = (llm_api_key or "").strip()
-        self.llm_api.top_k = max(1, int(llm_top_k or 3))
+        if self.llm_api is not None:
+            self.llm_api.base_url = (llm_base_url or "http://127.0.0.1:3000").strip().rstrip("/")
+            self.llm_api.api_key = (llm_api_key or "").strip()
+            self.llm_api.top_k = max(1, int(llm_top_k or 3))
 
     def _provider_obj(self, name: str):
         if name == "audd":
             return self.audd
         if name == "llm_api":
+            if self.llm_api is None:
+                raise RecognitionError("LLM API desabilitada como provedor de reconhecimento.")
             return self.llm_api
         return self.acrcloud
 

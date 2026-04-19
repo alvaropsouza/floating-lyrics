@@ -49,6 +49,21 @@ API Node.js containerizada para identificação de músicas e retorno de letras 
 
 ## 🚀 Quick Start
 
+### Modo dev sem rebuild a cada alteração
+
+```bat
+start-dev.bat
+```
+
+No `bash`/Git Bash:
+
+```bash
+./start-dev.sh
+```
+
+Esse fluxo sobe os containers com bind mount do `src/` e roda a API Node com `node --watch`.
+Mudanças em `llm-music-api/src/*.js` recarregam automaticamente sem `docker compose build`.
+
 ### 1. Clonar e Configurar
 
 ```bash
@@ -105,13 +120,13 @@ huggingface-cli download mistralai/Mistral-7B-Instruct-v0.2 \
 
 ```bash
 # Build da imagem Docker
-docker-compose build
+docker compose build
 
 # Iniciar serviço
-docker-compose up -d
+docker compose up -d
 
 # Ver logs
-docker-compose logs -f
+docker compose logs -f
 
 # Verificar saúde
 curl http://localhost:3000/health
@@ -403,7 +418,7 @@ model.save_pretrained("./lora-weights")
 - Considere modelo menor
 
 ### Erro: "Python process exited with code 1"
-- Verifique logs: `docker-compose logs`
+- Verifique logs: `docker compose logs`
 - Teste script Python manualmente: `python3 src/model_inference.py --query "test"`
 - Verifique dependências: `pip list`
 
@@ -413,6 +428,8 @@ model.save_pretrained("./lora-weights")
 llm-music-api/
 ├── Dockerfile                 # Imagem Docker com Node.js + Python
 ├── docker-compose.yml         # Orquestração de serviços
+├── docker-compose.dev.yml     # Override dev com bind mount + watch mode
+├── start-dev.bat              # Sobe stack dev sem rebuild do src/
 ├── package.json               # Dependências Node.js
 ├── requirements.txt           # Dependências Python
 ├── .env.example               # Configurações de exemplo

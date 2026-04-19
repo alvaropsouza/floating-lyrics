@@ -7,9 +7,10 @@ Objetivo
 - Priorizar estabilidade da sincronizacao da letra e responsividade da UI.
 
 Regras tecnicas
-- Nao bloquear a thread da interface Qt. Processos de rede e captura devem permanecer no worker.
+- Nao bloquear a UI. Processos de rede e captura devem permanecer no worker/thread layer.
+- Implementacao canonica do pipeline: `src/worker_headless.py`. `src/worker.py` e apenas um adaptador Qt (nao duplicar logica).
 - Em sincronizacao de tempo, usar relogio monotonic com time.perf_counter para calcular deltas.
-- Evitar chamadas de rede repetidas para a mesma musica; usar cache em memoria quando possivel.
+- Evitar chamadas de rede repetidas para a mesma musica; usar cache em memoria/disco quando possivel.
 - Preservar compatibilidade com Windows 10/11 e captura WASAPI loopback.
 - Sempre que for preciso fazer buscas no projeto (arquivos, simbolos ou trechos), usar o agente Explore.
 

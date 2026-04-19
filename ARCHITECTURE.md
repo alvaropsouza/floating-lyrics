@@ -45,15 +45,15 @@
 ### 1. Inicialização
 
 ```
-Backend Python (main_server.py):
+Backend Python (main_server_headless.py):
   1. Carrega Config (config.ini)
   2. Inicializa AudioCapture (WASAPI)
   3. Inicializa MultiProviderRecognizer (AudD + ACRCloud)
   4. Inicializa LyricsFetcher (lrclib + Musixmatch)
-  5. Cria RecognitionWorker (QThread)
+  5. Cria RecognitionWorkerHeadless (threading.Thread)
   6. Inicia WebSocket Server (asyncio, porta 8765)
-  7. Conecta sinais Qt → WebSocket Bridge
-  8. Worker começa a capturar áudio
+  7. Conecta callbacks do worker → WebSocketBridgeHeadless
+  8. Worker começa a capturar áudio (e espectro)
 
 Frontend Flutter:
   1. Cria janela frameless (bitsdojo_window)
@@ -260,26 +260,23 @@ Frontend Flutter:
 ### Backend Python
 
 ```
-Main Thread (Qt QCoreApplication):
-  └─> Event loop Qt (signals/slots)
-
-Worker Thread (RecognitionWorker extends QThread):
-  └─> Loop infinito:
-      ├─> Captura áudio (bloqueante 10s)
-      ├─> HTTP request reconhecimento (bloqueante 2-15s)
-      ├─> HTTP request letras (bloqueante 5-15s)
-      └─> Emite signals (thread-safe → Main Thread)
-
-WebSocket Thread (asyncio):
-  └─> Event loop asyncio separado
-  └─> aiohttp server
+Main Thread (asyncio):
+  └─> Event loop asyncio
+  └─> aiohttp WebSocket server
   └─> Broadcast para clientes conectados
-  └─> run_coroutine_threadsafe() para comunicar com Qt
+
+Worker Thread (RecognitionWorkerHeadless extends threading.Thread):
+  └─> Loop de reconhecimento:
+      ├─> Captura áudio (bloqueante)
+      ├─> HTTP request reconhecimento (bloqueante)
+      └─> Dispara callbacks (thread-safe → asyncio via run_coroutine_threadsafe)
+
+Spectrum Thread (interno do worker):
+  └─> Captura espectro continuamente para a UI Flutter
 ```
 
 **Comunicação Inter-Thread:**
-- Qt → asyncio: `asyncio.run_coroutine_threadsafe(coro, loop)`
-- Signals Qt são automaticamente thread-safe (queued connections)
+- Worker(threading) → asyncio: `asyncio.run_coroutine_threadsafe(coro, loop)`
 
 ### Frontend Flutter
 
@@ -301,7 +298,8 @@ WebSocket Stream:
 ```
 floating-lyrics/
 ├── main.py                    # PyQt6 standalone
-├── main_server.py             # Backend server (para Flutter)
+├── main_server.py             # Entry point compat (delegando ao headless)
+├── main_server_headless.py    # Backend server canônico (para Flutter)
 ├── config.ini                 # Configurações
 ├── requirements.txt           # Deps Python
 │
@@ -309,9 +307,10 @@ floating-lyrics/
 │   ├── audio_capture.py       # WASAPI loopback
 │   ├── song_recognition.py    # MultiProvider (AudD + ACRCloud)
 │   ├── lyrics_fetcher.py      # lrclib + Musixmatch
-│   ├── worker.py              # RecognitionWorker (QThread)
+│   ├── worker_headless.py     # RecognitionWorkerHeadless (threading)
+│   ├── worker.py              # Adaptador Qt sobre o worker_headless
 │   ├── websocket_server.py    # aiohttp WebSocket server
-│   └── websocket_bridge.py    # Qt signals → WebSocket
+│   └── websocket_bridge_headless.py # Worker callbacks → WebSocket
 │
 └── flutter_ui/
     ├── pubspec.yaml           # Deps Flutter

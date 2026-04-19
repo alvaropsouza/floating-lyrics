@@ -36,13 +36,24 @@ flutter pub get
 
 ## 🏃 Rodar
 
+### Um comando a partir da raiz
+
+```bat
+start_all.bat
+```
+
+No `bash`/Git Bash`, use `./start_all.sh`.
+
+Isso sobe `llm-music-api`, backend headless e Flutter com um comando.
+
 ### 1. Iniciar backend Python
 
 Em um terminal:
 
 ```bash
 # Na raiz do projeto
-python main_server.py
+python main_server_headless.py
+# (ou use: start_server.bat)
 ```
 
 Isso iniciará:

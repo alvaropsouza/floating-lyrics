@@ -1,0 +1,12 @@
+services:
+  model-server:
+    volumes:
+      - ./src:/app/src
+
+  llm-music-api:
+    command: ["node", "--watch", "src/server.js"]
+    volumes:
+      - ./src:/app/src
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./training_audio:/app/training_audio

@@ -20,6 +20,27 @@ Exibe as letras de músicas tocando no seu PC em uma janela flutuante e transpar
 
 ## 🚀 Quick Start
 
+### Um comando para subir tudo (dev)
+
+```bat
+start_all.bat
+```
+
+No `bash`/Git Bash:
+
+```bash
+./start_all.sh
+```
+
+`start_all.bat` abre 3 janelas separadas no Windows. `start_all.sh` sobe a stack no shell atual.
+
+Ambos fazem:
+- `llm-music-api` em modo dev via Docker, sem rebuild a cada alteração no `src/`
+- backend Python headless
+- frontend Flutter
+
+Se for o primeiro boot do `llm-music-api`, o Docker ainda pode precisar construir a imagem base uma vez.
+
 ### Versão Flutter (Recomendado - UI Moderna + Backend Headless)
 
 ```bash
@@ -233,7 +254,10 @@ floating-lyrics/
     ├── song_recognition.py  # Integração com a API AudD
     ├── lyrics_fetcher.py    # lrclib.net + Musixmatch (fallback)
     ├── lyrics_parser.py     # Parser de formato LRC
-    ├── worker.py            # QThread: pipeline captura → reconhece → letra
+    ├── worker_headless.py   # Worker canônico (threading): captura → reconhece → letra
+    ├── worker.py            # Adaptador Qt (signals) sobre o worker_headless
+    ├── websocket_server.py  # Servidor WebSocket (aiohttp)
+    └── websocket_bridge_headless.py # Bridge worker_headless → WebSocket
     └── ui/
         ├── main_window.py   # Janela de controle (PyQt6)
         └── lyrics_window.py # Overlay flutuante (PyQt6, frameless)
@@ -244,14 +268,14 @@ floating-lyrics/
 ## Sincronização de letras — como funciona
 
 ```
-Tempo t₀ = início da captura (time.time())
+Tempo t₀ = início da captura (time.perf_counter())
            │
            │  ←── 10s de áudio capturado ──►
            │
            AudD responde: timecode = "1:23" (83 000 ms)
            │  → o áudio capturado veio do segundo 83s da música
            │
-Posição atual = timecode_ms + (time.time() − t₀) × 1000
+Posição atual = timecode_ms + (time.perf_counter() − t₀) × 1000
 ```
 
 O campo `timecode` do AudD aponta **onde na música** o trecho capturado se encaixa, permitindo sincronização LRC precisa sem integração com o player.

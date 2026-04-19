@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from typing import Callable, Any
 
-from src.song_recognition import RateLimitError
+from src.song_recognition import LLMAPITrainer, RateLimitError
 
 
 _LOG = logging.getLogger(__name__)
@@ -32,12 +32,13 @@ class RecognitionWorkerHeadless(threading.Thread):
       4. Chama callbacks para notificar eventos
     """
 
-    def __init__(self, config, audio_capture, recognizer, lyrics_fetcher):
+    def __init__(self, config, audio_capture, recognizer, lyrics_fetcher, llm_trainer: LLMAPITrainer | None = None):
         super().__init__(daemon=True, name="RecognitionWorker")
         self._config = config
         self._audio = audio_capture
         self._recognizer = recognizer
         self._lyrics = lyrics_fetcher
+        self._llm_trainer = llm_trainer
         self._stop_flag = threading.Event()
         self._current_song_key: tuple[str, str, str] | None = None
         self._miss_streak: int = 0
@@ -72,8 +73,14 @@ class RecognitionWorkerHeadless(threading.Thread):
         # ThreadPool para busca de letras não bloqueante
         self._lyrics_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LyricsFetch")
         self._pending_lyrics_future: Future | None = None
+
+        # ThreadPool para treino assíncrono do índice de áudio da LLM API
+        self._training_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LLMTrain")
+        self._pending_training_future: Future | None = None
+        self._training_requested = False
+        self._last_training_request_at = 0.0
         
-        # Detecção de silêncio para forçar redetecção
+        # Detecção de espectro baixo para forçar redetecção
         self._low_spectrum_count = 0  # Contador de frames com espectro baixo
         # Configurar via config.ini ou usar padrões
         self._silence_frames_threshold = self._config.getint(
@@ -82,11 +89,6 @@ class RecognitionWorkerHeadless(threading.Thread):
         self._low_spectrum_max = self._config.getfloat(
             "Recognition", "silence_spectrum_threshold", fallback=0.05
         )  # Threshold: max 5% de energia normalizada
-        
-        # Histórico de espectro para detectar mudanças bruscas
-        self._spectrum_history: list[float] = []  # Histórico de energias (últimos 20 frames = 1s)
-        self._max_spectrum_history = 20
-        self._spectrum_change_threshold = 0.4  # Mudança de 40% de energia = mudança de música
         
         # Detecção de confiança baixa
         self._last_confidence: float | None = None
@@ -116,8 +118,58 @@ class RecognitionWorkerHeadless(threading.Thread):
         normalized = normalized.strip("-._")
         return normalized or fallback
 
+    def _request_llm_training(self) -> None:
+        if self._llm_trainer is None:
+            return
+        if not self._config.getboolean("Recognition", "auto_train_llm_on_new_audio", fallback=True):
+            return
+
+        self._training_requested = True
+        self._start_llm_training_if_idle()
+
+    def _start_llm_training_if_idle(self) -> None:
+        if self._llm_trainer is None or not self._training_requested:
+            return
+        if self._pending_training_future and not self._pending_training_future.done():
+            return
+
+        debounce_s = max(
+            0,
+            self._config.getint("Recognition", "llm_train_debounce_s", fallback=15),
+        )
+        delay_s = max(0.0, debounce_s - (time.monotonic() - self._last_training_request_at))
+        self._training_requested = False
+        self._last_training_request_at = time.monotonic() + delay_s
+        self._pending_training_future = self._training_executor.submit(self._run_llm_training, delay_s)
+        self._pending_training_future.add_done_callback(self._on_llm_training_done)
+
+    def _run_llm_training(self, delay_s: float = 0.0) -> dict[str, Any]:
+        if delay_s > 0:
+            time.sleep(delay_s)
+        _LOG.info("🧠 Disparando treino automático do índice de áudio da LLM API...")
+        return self._llm_trainer.trigger_training()
+
+    def _on_llm_training_done(self, future: Future) -> None:
+        try:
+            result = future.result()
+            items = result.get("items") if isinstance(result, dict) else None
+            skipped = result.get("skipped") if isinstance(result, dict) else None
+            if items is not None:
+                _LOG.info(
+                    "✅ Treino automático concluído na LLM API (itens=%s, ignorados=%s).",
+                    items,
+                    skipped if skipped is not None else 0,
+                )
+            else:
+                _LOG.info("✅ Treino automático concluído na LLM API.")
+        except Exception as exc:
+            _LOG.warning("Falha ao treinar automaticamente a LLM API: %s", exc)
+        finally:
+            if self._training_requested and not self._stop_flag.is_set():
+                self._start_llm_training_if_idle()
+
     def _save_training_audio_if_needed(self, result, song_key: tuple[str, str, str], audio_bytes: bytes) -> None:
-        if not self._config.getboolean("Recognition", "save_audio_for_training", fallback=False):
+        if not self._config.getboolean("Recognition", "save_audio_for_training", fallback=True):
             return
 
         cooldown_s = max(
@@ -143,6 +195,7 @@ class RecognitionWorkerHeadless(threading.Thread):
             target_path.write_bytes(audio_bytes)
             self._last_training_save_by_song[song_key] = now
             _LOG.info("🎓 Trecho salvo para treino: %s", target_path.name)
+            self._request_llm_training()
         except Exception as exc:
             _LOG.warning("Falha ao salvar trecho para treino: %s", exc)
 
@@ -172,6 +225,7 @@ class RecognitionWorkerHeadless(threading.Thread):
         if self._pending_lyrics_future and not self._pending_lyrics_future.done():
             self._pending_lyrics_future.cancel()
         self._lyrics_executor.shutdown(wait=False, cancel_futures=True)
+        self._training_executor.shutdown(wait=False, cancel_futures=True)
 
     def join(self, timeout=None) -> None:
         """Aguarda a thread terminar."""
@@ -239,48 +293,16 @@ class RecognitionWorkerHeadless(threading.Thread):
         _LOG.info("Thread de espectro parada")
 
     def _check_silence_and_reset(self, spectrum: list[float]) -> None:
-        """Detecta silêncio prolongado, mudanças bruscas de espectro e força redetecção se necessário."""
+        """Detecta espectro baixo prolongado e força redetecção se necessário."""
         # Ignorar se não há música tocando atualmente
         if self._current_song_key is None:
             self._low_spectrum_count = 0
-            self._spectrum_history.clear()
             return
         
         # Calcular energia média do espectro (normalizado 0-1)
         avg_energy = sum(spectrum) / len(spectrum) if spectrum else 0.0
-        
-        # ═════════════════════════════════════════════════════════════════
-        # 1. Detecção de mudança bruta de espectro (crossfade ou mudança rápida)
-        # ═════════════════════════════════════════════════════════════════
-        if self._spectrum_history:
-            prev_energy = self._spectrum_history[-1]
-            energy_change = abs(avg_energy - prev_energy) / (prev_energy + 0.001)  # Evitar divisão por zero
-            
-            # Se energia mudou drasticamente (ex: 0.8 → 0.3), pode ser mudança de música
-            if energy_change > self._spectrum_change_threshold and avg_energy < 0.3:
-                _LOG.warning(
-                    f"⚠️ Mudança brusca de espectro detectada (Δ={energy_change:.1%}). "
-                    f"Resetando música e forçando redetecção rápida."
-                )
-                self._current_song_key = None
-                self._current_song_duration_s = 0.0
-                self._miss_streak = 0
-                self._low_spectrum_count = 0
-                self._spectrum_history.clear()
-                self._last_confidence = None
-                self._low_confidence_count = 0
-                self._emit('song_not_found')
-                return
-        
-        # Manter histórico de últimas energias
-        self._spectrum_history.append(avg_energy)
-        if len(self._spectrum_history) > self._max_spectrum_history:
-            self._spectrum_history.pop(0)
-        
-        # ═════════════════════════════════════════════════════════════════
-        # 2. Detecção de silêncio prolongado
-        # ═════════════════════════════════════════════════════════════════
-        # Checar se está abaixo do threshold de silêncio
+
+        # Checar se está abaixo do threshold de silêncio/espectro zerado
         if avg_energy < self._low_spectrum_max:
             self._low_spectrum_count += 1
             
@@ -296,7 +318,6 @@ class RecognitionWorkerHeadless(threading.Thread):
                 self._current_song_duration_s = 0.0
                 self._miss_streak = 0
                 self._low_spectrum_count = 0
-                self._spectrum_history.clear()
                 self._last_confidence = None
                 self._low_confidence_count = 0
                 
@@ -658,7 +679,6 @@ class RecognitionWorkerHeadless(threading.Thread):
             self._current_song_duration_s = 0.0
             self._miss_streak = 0
             self._low_confidence_count = 0  # Reset contador de confiança também
-            self._spectrum_history.clear()  # Limpar histórico de espectro
             self._emit('song_not_found')
         
         self._emit('status_changed', 'Música não identificada')

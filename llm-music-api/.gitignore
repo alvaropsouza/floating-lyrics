@@ -10,3 +10,4 @@ models/
 !models/.gitkeep
 .vscode/
 .idea/
+training_audio

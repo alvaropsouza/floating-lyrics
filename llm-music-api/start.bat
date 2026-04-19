@@ -30,12 +30,8 @@ if not exist "models" (
     pause
 )
 
-echo Building Docker image...
-docker-compose build
-
-echo.
 echo Starting containers...
-docker-compose up -d
+docker compose up -d
 
 echo.
 echo Waiting for service to be ready...
@@ -50,13 +46,13 @@ if %errorlevel% equ 0 (
     echo API available at: http://localhost:3000
     echo.
     echo View logs:
-    echo   docker-compose logs -f
+    echo   docker compose logs -f
     echo.
     echo Stop service:
-    echo   docker-compose down
+    echo   docker compose down
 ) else (
     echo Service failed to start. Check logs:
-    echo   docker-compose logs
+    echo   docker compose logs
 )
 
 pause

@@ -42,7 +42,8 @@ flutter doctor -v
 pip install -r requirements.txt
 
 # Rodar servidor backend
-python main_server.py
+python main_server_headless.py
+# (ou use: start_server.bat)
 ```
 
 **Saída esperada:**
@@ -172,6 +173,7 @@ OutputBaseFilename=FloatingLyrics-Setup
 [Files]
 Source: "flutter_ui\build\windows\runner\Release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 Source: "main_server.py"; DestDir: "{app}"; Flags: ignoreversion
+Source: "main_server_headless.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "src\*"; DestDir: "{app}\src"; Flags: ignoreversion recursesubdirs
 
 [Run]
