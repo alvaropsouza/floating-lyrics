@@ -95,28 +95,26 @@ class RecognitionWorkerHeadless(threading.Thread):
             "disable_api_recognition_while_tracking",
             fallback=True,
         )
+        # Intervalo de um frame do loop de espectro (~30 FPS)
+        _FRAME_DT_S = 0.033
+
         self._change_similarity_threshold = self._config.getfloat(
             "Recognition",
             "local_change_similarity_threshold",
             fallback=0.72,
         )
-        self._change_frames_threshold = max(
-            1,
-            self._config.getint("Recognition", "local_change_frames_threshold", fallback=30),
+        _window_s = self._config.getfloat(
+            "Recognition", "local_change_window_s", fallback=0.7
         )
+        self._change_frames_threshold = max(1, round(_window_s / _FRAME_DT_S))
         self._change_min_energy = self._config.getfloat(
             "Recognition",
             "local_change_min_energy",
             fallback=0.08,
         )
-        self._change_ema_alpha = self._config.getfloat(
-            "Recognition",
-            "local_change_ema_alpha",
-            fallback=0.05,
-        )
         self._change_cooldown_s = max(
             0,
-            self._config.getint("Recognition", "local_change_cooldown_s", fallback=5),
+            self._config.getfloat("Recognition", "local_change_cooldown_s", fallback=5.0),
         )
         # Janela deslizante de frames: bool (True = frame divergente)
         self._change_window_size = self._change_frames_threshold
@@ -126,16 +124,16 @@ class RecognitionWorkerHeadless(threading.Thread):
 
         # Detecção silence→audio (gatilho mais confiável que espectro)
         self._silence_frames = 0
-        self._silence_trigger_frames = max(
-            1,
-            self._config.getint("Recognition", "silence_trigger_frames", fallback=20),
-        )  # 20 frames * 50ms = 1s de silêncio para armar o gatilho
+        _trigger_s = self._config.getfloat(
+            "Recognition", "silence_trigger_s", fallback=0.7
+        )
+        self._silence_trigger_frames = max(1, round(_trigger_s / _FRAME_DT_S))
         self._silence_triggered = False  # True = estava em silêncio, esperando nova música
         self._post_silence_audio_frames = 0
-        self._silence_recovery_frames = max(
-            1,
-            self._config.getint("Recognition", "silence_recovery_frames", fallback=8),
+        _recovery_s = self._config.getfloat(
+            "Recognition", "silence_recovery_s", fallback=0.3
         )
+        self._silence_recovery_frames = max(1, round(_recovery_s / _FRAME_DT_S))
         self._silence_recovery_energy_multiplier = self._config.getfloat(
             "Recognition",
             "silence_recovery_energy_multiplier",
@@ -403,20 +401,26 @@ class RecognitionWorkerHeadless(threading.Thread):
             self._current_lyrics_index = 0
         self._emit('song_not_found')
 
-    def _emit_compensated_timecode(self, timecode_ms: int, capture_start: float, context: str) -> None:
-        """Emite timecode compensado para latência de captura/rede/processamento."""
+    def _emit_compensated_timecode(self, timecode_ms: int, capture_end: float, context: str) -> None:
+        """Emite timecode compensado pela latência de rede/processamento.
+
+        `capture_end` deve ser o ponto de referência que corresponde ao instante
+        em que o último sample de áudio foi gerado pelo hardware — calculado como:
+            audio.last_audio_end_time - audio.last_input_latency_s
+        Isso elimina o overhead de cleanup do stream e a latência de buffer WASAPI.
+        """
         if timecode_ms <= 0:
             return
-        elapsed_ms = int((time.perf_counter() - capture_start) * 1000)
+        elapsed_ms = int((time.perf_counter() - capture_end) * 1000)
         compensated_timecode = timecode_ms + elapsed_ms
-        _LOG.debug(
-            "%s: %dms + %dms = %dms",
+        _LOG.info(
+            "%s: play_offset=%dms + proc/rede=%dms = %dms",
             context,
             timecode_ms,
             elapsed_ms,
             compensated_timecode,
         )
-        self._emit('timecode_updated', compensated_timecode, capture_start)
+        self._emit('timecode_updated', compensated_timecode, capture_end)
 
     def _update_local_change_detector(self, spectrum: list[float]) -> None:
         if self._current_song_key is None:
@@ -609,6 +613,19 @@ class RecognitionWorkerHeadless(threading.Thread):
             duration = self._capture_duration_for_cycle()
             _LOG.debug(f"Worker: iniciando captura de {duration}s de áudio...")
             audio_data = self._audio.capture(duration)
+            # Referência dinâmica: instante do último sample capturado menos a latência
+            # de buffer do WASAPI (delay entre render → loopback disponível).
+            # Isso faz a compensação de timecode se adaptar automaticamente ao hardware.
+            _audio_end = self._audio.last_audio_end_time
+            _wasapi_latency = self._audio.last_input_latency_s
+            capture_end = _audio_end - _wasapi_latency  # ponto exato de "agora" no sinal de áudio
+            if _wasapi_latency > 0:
+                _LOG.debug(
+                    "Timing dinâmico: last_read=%.3fs atrás, WASAPI latency=%.0fms → capture_ref=%.3fs atrás",
+                    time.perf_counter() - _audio_end,
+                    _wasapi_latency * 1000,
+                    time.perf_counter() - capture_end,
+                )
             _LOG.debug(f"Worker: captura concluída ({len(audio_data) if audio_data else 0} bytes)")
             if audio_data is None or len(audio_data) == 0:
                 _LOG.warning("Nenhum áudio capturado após %ds — dispositivo de captura retornou vazio.", duration)
@@ -644,13 +661,13 @@ class RecognitionWorkerHeadless(threading.Thread):
         self._emit('status_changed', "🔍 Reconhecendo música...")
         try:
             _LOG.debug("Worker: iniciando reconhecimento...")
-            result, updated_capture_start = self._recognizer.recognize(audio_data, capture_start)
+            result, _ = self._recognizer.recognize(audio_data, capture_start)
             elapsed = time.perf_counter() - start_time
             found = result is not None
             _LOG.debug(f"Worker: reconhecimento concluído em {elapsed:.1f}s | encontrado={found}")
             
             if found and result:
-                self._handle_song_found(result, updated_capture_start, audio_data)
+                self._handle_song_found(result, capture_end)
             else:
                 self._handle_song_not_found()
                 
@@ -730,8 +747,12 @@ class RecognitionWorkerHeadless(threading.Thread):
         
         return False  # Aceitar resultado
 
-    def _handle_song_found(self, result, capture_start: float, audio_bytes: bytes) -> None:
-        """Processa resultado quando música é encontrada."""
+    def _handle_song_found(self, result, capture_ref: float) -> None:
+        """Processa resultado quando música é encontrada.
+        
+        `capture_ref` deve ser o instante em que a captura de áudio TERMINOU
+        (time.perf_counter() logo após audio.capture() retornar).
+        """
         song_key = (result.title, result.artist, result.album or "")
         self._last_recognition_time = time.perf_counter()
         self._current_song_duration_s = result.duration_s or 0.0
@@ -749,7 +770,7 @@ class RecognitionWorkerHeadless(threading.Thread):
             if result.timecode_ms is not None and result.timecode_ms > 0:
                 self._emit_compensated_timecode(
                     result.timecode_ms,
-                    capture_start,
+                    capture_ref,
                     "🎵 Timecode compensado",
                 )
             self._miss_streak = 0
@@ -768,7 +789,7 @@ class RecognitionWorkerHeadless(threading.Thread):
         self._low_confidence_count = 0  # Reset quando muda de música com sucesso
         
         # Fetch and emit lyrics
-        self._handle_lyrics_for_song(song_key, result, capture_start)
+        self._handle_lyrics_for_song(song_key, result, capture_ref)
 
     def _handle_lyrics_for_song(self, song_key, result, capture_start: float) -> None:
         """Busca e emite letras para a música (de forma assíncrona)."""
@@ -780,8 +801,9 @@ class RecognitionWorkerHeadless(threading.Thread):
             if cached is None:
                 self._emit('lyrics_not_found')
             else:
-                content, synced = cached
-                self._emit('lyrics_ready', content, synced, capture_start)
+                content, synced, *_rest = cached
+                provider = _rest[0] if _rest else ""
+                self._emit('lyrics_ready', content, synced, capture_start, provider)
             
             # Update timecode anyway
             if result.timecode_ms is not None and result.timecode_ms > 0:
@@ -867,7 +889,7 @@ class RecognitionWorkerHeadless(threading.Thread):
                 else:
                     lyrics_text = "\n".join(lyrics_result.lines)
                 
-                self._lyrics_cache[song_key] = (lyrics_text, lyrics_result.synced)
+                self._lyrics_cache[song_key] = (lyrics_text, lyrics_result.synced, lyrics_result.provider)
 
                 # Emitir timecode ANTES das letras: Flutter recebe a posição
                 # correta antes de renderizar a primeira linha, evitando o
@@ -875,11 +897,11 @@ class RecognitionWorkerHeadless(threading.Thread):
                 if result.timecode_ms is not None and result.timecode_ms > 0:
                     self._emit_compensated_timecode(
                         result.timecode_ms,
-                        capture_start,
+                        capture_start,  # capture_end herdado pelo closure
                         "🎵 Timecode antes de lyrics_ready",
                     )
 
-                self._emit('lyrics_ready', lyrics_text, lyrics_result.synced, capture_start)
+                self._emit('lyrics_ready', lyrics_text, lyrics_result.synced, capture_start, lyrics_result.provider)
 
                 # 🎤 STT Sync: Atualizar letras e iniciar thread
                 self._update_stt_lyrics(lyrics_text)

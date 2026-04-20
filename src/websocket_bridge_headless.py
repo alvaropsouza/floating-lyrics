@@ -85,11 +85,11 @@ class WebSocketBridgeHeadless:
         # Pode enviar status se quiser
         self._schedule_coro(self._server.emit_status("📝 Buscando letras..."))
 
-    def on_lyrics_ready(self, lyrics: str, synced: bool, capture_start: float) -> None:
+    def on_lyrics_ready(self, lyrics: str, synced: bool, capture_start: float, provider: str = "") -> None:
         """Handler para lyrics_ready."""
-        _LOG.info(f"WS Bridge: lyrics_ready (synced={synced})")
+        _LOG.info(f"WS Bridge: lyrics_ready (synced={synced}, provider={provider!r})")
         # NÃO adicionar offset manual - timecode vem compensado automaticamente
-        self._schedule_coro(self._server.emit_lyrics_ready(lyrics, synced, capture_start, offset_ms=0))
+        self._schedule_coro(self._server.emit_lyrics_ready(lyrics, synced, capture_start, offset_ms=0, provider=provider))
 
     def on_lyrics_not_found(self) -> None:
         """Handler para lyrics_not_found."""

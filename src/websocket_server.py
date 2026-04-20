@@ -206,12 +206,13 @@ class WebSocketServer:
             "data": {}
         })
 
-    async def emit_lyrics_ready(self, lyrics: str, synced: bool, capture_start_time: float | None = None, offset_ms: int = 0) -> None:
+    async def emit_lyrics_ready(self, lyrics: str, synced: bool, capture_start_time: float | None = None, offset_ms: int = 0, provider: str = "") -> None:
         """Emite evento de letras prontas."""
         data = {
             "lyrics": lyrics,
             "synced": synced,
-            "offset_ms": offset_ms  # Offset de sincronização (pode ser negativo)
+            "offset_ms": offset_ms,  # Offset de sincronização (pode ser negativo)
+            "provider": provider,
         }
         if capture_start_time is not None:
             data["capture_start_time"] = capture_start_time

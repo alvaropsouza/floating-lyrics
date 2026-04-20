@@ -7,6 +7,7 @@ Dependência: pyaudiowpatch
 Funciona exclusivamente no Windows via WASAPI loopback.
 """
 
+import contextlib
 import io
 import logging
 import threading
@@ -73,7 +74,22 @@ class AudioCapture:
         self._spectrum_sample_rate: int = 44100
         self._spectrum_channels: int = 2
 
+        # Timing de capture — atualizados após cada _capture_unsafe()
+        # Usados pelo worker para compensação precisa de timecode.
+        self._last_audio_end_time: float = 0.0   # perf_counter() após último stream.read()
+        self._last_input_latency_s: float = 0.0  # latência reportada pelo WASAPI para o dispositivo
+
     # ── Lifecycle ───────────────────────────────────────────────────────────
+
+    @property
+    def last_audio_end_time(self) -> float:
+        """perf_counter() registrado imediatamente após o último stream.read() da captura mais recente."""
+        return self._last_audio_end_time
+
+    @property
+    def last_input_latency_s(self) -> float:
+        """Latência de buffer do dispositivo WASAPI (segundos) reportada pelo stream de captura."""
+        return self._last_input_latency_s
 
     def set_shutdown_flag(self, flag: threading.Event) -> None:
         self._shutdown_flag = flag
@@ -233,9 +249,16 @@ class AudioCapture:
         except OSError as exc:
             raise AudioCaptureError(f"Falha ao abrir stream de captura: {exc}") from exc
 
+        # Latência de buffer do dispositivo WASAPI — usada para compensação de timecode.
+        # Para loopback, reflete o tamanho do buffer de renderização (delay entre render → captura).
+        input_latency_s: float = 0.0
+        with contextlib.suppress(Exception):
+            input_latency_s = stream.get_input_latency()
+
         frames: list[bytes] = []
         total_frames = int(sample_rate * duration)
         captured = 0
+        last_read_time: float = 0.0
 
         try:
             while captured < total_frames:
@@ -244,12 +267,16 @@ class AudioCapture:
                 to_read = min(self._FRAMES_PER_BUFFER, total_frames - captured)
                 try:
                     chunk = stream.read(to_read, exception_on_overflow=False)
+                    last_read_time = time.perf_counter()  # imediatamente após cada leitura
                 except OSError as exc:
                     _LOG.warning("Overflow durante captura: %s", exc)
                     break
                 frames.append(chunk)
                 captured += to_read
         finally:
+            # Gravar ANTES do cleanup — mede o instante do último sample disponível.
+            self._last_audio_end_time = last_read_time if last_read_time > 0 else time.perf_counter()
+            self._last_input_latency_s = input_latency_s
             stream.stop_stream()
             stream.close()
 

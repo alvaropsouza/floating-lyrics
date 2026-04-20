@@ -44,6 +44,7 @@ class LyricsResult:
     lines: list[str]
     synced: bool       # True  → LRC format with timestamps
     raw_lrc: str = ""  # Full LRC text (only when synced=True)
+    provider: str = "" # Provedor que retornou a letra (ex: "lrclib", "musixmatch")
 
 
 
@@ -498,7 +499,8 @@ class MusixmatchFetcher:
 
         # Strip Musixmatch's commercial usage footer.
         lines = [
-            ln for ln in body.splitlines() if not ln.startswith("****")
+            ln for ln in body.splitlines()
+            if not ln.startswith("****") and not _SECTION_MARKER_RE.match(ln.strip())
         ]
         return LyricsResult(lines=lines, synced=False)
 
@@ -575,6 +577,7 @@ class AudCRLyricsFetcher:
             return None
 
         lines = [ln.rstrip() for ln in lyrics.splitlines()]
+        lines = [ln for ln in lines if not _SECTION_MARKER_RE.match(ln.strip())]
         if not any(ln.strip() for ln in lines):
             return None
 
@@ -657,6 +660,7 @@ class LyricsFetcher:
                 f"album={album}",
                 f"duration_s={max(0, int(duration_s or 0))}",
                 f"synced={synced}",
+                f"provider={result.provider}",
                 "---",
                 body,
             ]
@@ -675,16 +679,20 @@ class LyricsFetcher:
             meta[k.strip().lower()] = v.strip()
 
         synced = meta.get("synced", "0") == "1"
+        provider = meta.get("provider", "")
         if synced:
             lrc = body.strip("\n")
             if not lrc:
                 return None
-            return LyricsResult(lines=lrc.splitlines(), synced=True, raw_lrc=lrc)
+            # Aplicar filtro de marcadores de seção também ao carregar do cache
+            clean_lines = [ln for ln in lrc.splitlines() if not _is_lrc_section_marker(ln)]
+            clean_lrc = "\n".join(clean_lines)
+            return LyricsResult(lines=clean_lines, synced=True, raw_lrc=clean_lrc, provider=provider)
 
-        lines = list(body.splitlines())
+        lines = [ln for ln in body.splitlines() if not _SECTION_MARKER_RE.match(ln.strip())]
         if not any(ln.strip() for ln in lines):
             return None
-        return LyricsResult(lines=lines, synced=False)
+        return LyricsResult(lines=lines, synced=False, provider=provider)
 
     def _load_disk_cache(self, title: str, artist: str, album: str) -> Optional[LyricsResult]:
         path = self._disk_path(title, artist, album)
@@ -763,6 +771,7 @@ class LyricsFetcher:
                 continue
 
             if result is not None:
+                result.provider = provider
                 _LOG.info("Letra encontrada via provedor: %s", provider)
                 self._cache[key] = result
                 self._save_disk_cache(title, artist, album, duration_s, result)

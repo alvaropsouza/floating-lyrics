@@ -191,10 +191,36 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
           children: [
             for (int index = 0; index < lyrics.lines.length; index++)
               _buildLyricLine(lyrics, index),
+            if (lyrics.provider.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 20, bottom: 4),
+                child: Text(
+                  _providerLabel(lyrics.provider),
+                  style: const TextStyle(
+                    color: Colors.white24,
+                    fontSize: 10,
+                    fontStyle: FontStyle.italic,
+                    letterSpacing: 0.4,
+                  ),
+                ),
+              ),
           ],
         ),
       ),
     );
+  }
+
+  static String _providerLabel(String provider) {
+    switch (provider) {
+      case 'lrclib':
+        return 'lrclib.net';
+      case 'musixmatch':
+        return 'Musixmatch';
+      case 'audcr':
+        return 'AudD';
+      default:
+        return provider;
+    }
   }
 
   Widget _buildLyricLine(LyricsData lyrics, int index) {

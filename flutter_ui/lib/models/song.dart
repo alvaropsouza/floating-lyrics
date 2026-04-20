@@ -25,11 +25,13 @@ class LyricsData {
   final String content;
   final bool synced;
   final List<LyricLine> lines;
+  final String provider;
 
   LyricsData({
     required this.content,
     required this.synced,
     List<LyricLine>? lines,
+    this.provider = '',
   }) : lines = lines ?? _parseLyrics(content, synced);
 
   static List<LyricLine> _parseLyrics(String content, bool synced) {
