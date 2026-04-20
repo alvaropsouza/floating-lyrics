@@ -50,7 +50,8 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
 
     // Debug ocasional
     if (_currentLineIndex == 0 && currentPositionMs > 1000) {
-      debugPrint('📍 Posição atual: ${currentPositionMs}ms (${(currentPositionMs / 1000).toStringAsFixed(1)}s)');
+      debugPrint(
+          '📍 Posição atual: ${currentPositionMs}ms (${(currentPositionMs / 1000).toStringAsFixed(1)}s)');
     }
 
     // Encontrar linha atual baseada na posição calculada
