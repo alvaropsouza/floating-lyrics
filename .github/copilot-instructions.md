@@ -12,3 +12,8 @@ Key rules:
 - Do not add/commit real API keys or secrets.
 - Always start the full project stack from the repository root using `start_all` (`start_all.bat` on Windows CMD/PowerShell or `./start_all.sh` on Git Bash), unless the user explicitly asks for a different startup flow.
 
+# Best Practices for Code Changes
+
+- Avoid creating too many .md files for documentation; prefer adding to existing docs when possible.
+- focus docs files in the `docs/` folder, and keep them organized by topic (e.g., `docs/STT_README.md`, `docs/ARCHITECTURE_VISUALIZATION.md`, etc.).
+

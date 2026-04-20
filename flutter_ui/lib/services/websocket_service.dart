@@ -16,6 +16,7 @@ class WebSocketService extends ChangeNotifier {
   Song? _currentSong;
   LyricsData? _lyrics;
   int _timecodeMs = 0;
+  int _lrcOffsetMs = 0;
   int? _localTimestamp; // Timestamp local (ms) quando recebeu o timecode
   bool _isConnected = false;
   bool _isPaused = false;
@@ -29,22 +30,23 @@ class WebSocketService extends ChangeNotifier {
   Song? get currentSong => _currentSong;
   LyricsData? get lyrics => _lyrics;
   int get timecodeMs => _timecodeMs;
+  int get lrcOffsetMs => _lrcOffsetMs;
   bool get isConnected => _isConnected;
   bool get isPaused => _isPaused;
   bool get isDebugOnly => _isDebugOnly;
   String? get error => _error;
   List<double> get audioSpectrum => _audioSpectrum;
 
-  /// Calcula posição atual da música em tempo real
+  /// Calcula posição atual da música em tempo real, com offset de letra aplicado
   int get currentPositionMs {
-    if (_localTimestamp == null) return _timecodeMs;
+    if (_localTimestamp == null) return _timecodeMs + _lrcOffsetMs;
 
     // Tempo decorrido desde que recebemos o timecode (em ms)
     final now = DateTime.now().millisecondsSinceEpoch;
     final elapsedMs = now - _localTimestamp!;
 
-    // Posição = timecode inicial + tempo decorrido
-    return _timecodeMs + elapsedMs;
+    // Posição = timecode inicial + tempo decorrido + offset de letra
+    return _timecodeMs + elapsedMs + _lrcOffsetMs;
   }
 
   void connect() {
@@ -255,6 +257,19 @@ class WebSocketService extends ChangeNotifier {
 
   void setDebugOnly(bool enabled) {
     sendMessage('debug_only', {'enabled': enabled});
+  }
+
+  /// Ajusta o offset de sincronização das letras por [deltaMs] milissegundos.
+  /// Valores positivos avançam as letras (mostram a próxima linha mais cedo).
+  /// Valores negativos atrasam as letras.
+  void adjustLrcOffset(int deltaMs) {
+    _lrcOffsetMs += deltaMs;
+    notifyListeners();
+  }
+
+  void resetLrcOffset() {
+    _lrcOffsetMs = 0;
+    notifyListeners();
   }
 
   void toggleDebugOnly() {

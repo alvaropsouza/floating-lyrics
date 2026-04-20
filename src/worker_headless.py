@@ -17,6 +17,16 @@ from typing import Callable, Any
 
 from src.song_recognition import RateLimitError
 
+# STT Sync (Fase 2) - Importação condicional
+try:
+    from src.speech_recognition import SpeechRecognizer
+    from src.lyrics_matcher import LyricsMatcher
+    _STT_AVAILABLE = True
+except ImportError:
+    _STT_AVAILABLE = False
+    SpeechRecognizer = None
+    LyricsMatcher = None
+
 
 _LOG = logging.getLogger(__name__)
 
@@ -108,9 +118,19 @@ class RecognitionWorkerHeadless(threading.Thread):
             0,
             self._config.getint("Recognition", "local_change_cooldown_s", fallback=5),
         )
+        # Janela deslizante de frames: bool (True = frame divergente)
+        self._change_window_size = self._change_frames_threshold
+        self._change_window: list[bool] = []
         self._change_baseline: list[float] | None = None
-        self._change_bad_frames = 0
         self._last_change_trigger_at = 0.0
+
+        # Detecção silence→audio (gatilho mais confiável que espectro)
+        self._silence_frames = 0
+        self._silence_trigger_frames = max(
+            1,
+            self._config.getint("Recognition", "silence_trigger_frames", fallback=20),
+        )  # 20 frames * 50ms = 1s de silêncio para armar o gatilho
+        self._silence_triggered = False  # True = estava em silêncio, esperando nova música
 
 
         
@@ -128,6 +148,29 @@ class RecognitionWorkerHeadless(threading.Thread):
         
         # Configurar callback de captura fresca no recognizer
         self._recognizer.set_fresh_capture_callback(self._capture_fresh_audio)
+
+        # ─ STT Sync Integration (Fase 2) ──────────────────────────────────
+        self._stt_enabled = False
+        self._stt_mode = "timestamp_only"  # timestamp_only | stt_only | hybrid
+        self._stt_recognizer: SpeechRecognizer | None = None
+        self._stt_matcher: LyricsMatcher | None = None
+        self._stt_thread: threading.Thread | None = None
+        self._stt_running = False
+        self._stt_lock = threading.Lock()
+        self._current_lyrics_for_stt: list[str] | None = None
+        self._current_lyrics_index: int = 0
+        self._stt_last_segment = None
+        
+        # Ler configurações STT de config.ini
+        if _STT_AVAILABLE:
+            self._stt_enabled = self._config.getboolean("SpeechSync", "enabled", fallback=False)
+            self._stt_mode = self._config.get("SpeechSync", "mode", fallback="timestamp_only")
+            self._init_stt()
+        
+        # Callbacks para STT (adicionados aos callbacks existentes)
+        self._callbacks.setdefault('stt_recognized', [])
+        self._callbacks.setdefault('stt_matched', [])
+        self._callbacks.setdefault('sync_corrected', [])
 
     @staticmethod
     def _sanitize_part(value: str, fallback: str) -> str:
@@ -163,6 +206,9 @@ class RecognitionWorkerHeadless(threading.Thread):
         self._spectrum_running = False
         self._stop_flag.set()
         self._pause_flag.clear()
+        
+        # 🎤 Parar STT sync
+        self._stop_stt_loop()
         
         # Cancelar busca de letras pendente e aguardar shutdown
         if self._pending_lyrics_future and not self._pending_lyrics_future.done():
@@ -337,52 +383,89 @@ class RecognitionWorkerHeadless(threading.Thread):
             out[i] *= inv
         return out
 
+    def _reset_song_state(self, reason: str) -> None:
+        """Limpa estado de música atual e emite evento para forçar redetecção."""
+        _LOG.info("Mudanca de musica detectada (%s). Forcando redeteccao.", reason)
+        self._last_change_trigger_at = time.monotonic()
+        self._current_song_key = None
+        self._current_song_duration_s = 0.0
+        self._miss_streak = 0
+        self._last_confidence = None
+        self._low_confidence_count = 0
+        self._change_baseline = None
+        self._change_window = []
+        self._silence_triggered = False
+        self._emit('song_not_found')
+
     def _update_local_change_detector(self, spectrum: list[float]) -> None:
         if self._current_song_key is None:
+            # Sem música ativa: manter apenas detecção de silêncio para não disparar desnecessariamente
             self._change_baseline = None
-            self._change_bad_frames = 0
-            return
-
-        avg_energy = sum(spectrum) / len(spectrum) if spectrum else 0.0
-        if avg_energy < self._change_min_energy:
-            self._change_bad_frames = 0
+            self._change_window = []
+            avg_energy = sum(spectrum) / len(spectrum) if spectrum else 0.0
+            if avg_energy < self._change_min_energy:
+                self._silence_frames += 1
+            else:
+                self._silence_frames = 0
+                self._silence_triggered = False
             return
 
         now = time.monotonic()
-        if self._change_cooldown_s > 0 and (now - self._last_change_trigger_at) < self._change_cooldown_s:
+        in_cooldown = self._change_cooldown_s > 0 and (now - self._last_change_trigger_at) < self._change_cooldown_s
+
+        avg_energy = sum(spectrum) / len(spectrum) if spectrum else 0.0
+        is_silent = avg_energy < self._change_min_energy
+
+        # ── Detecção silêncio → áudio ───────────────────────────────────────
+        if is_silent:
+            self._silence_frames += 1
+            if self._silence_frames >= self._silence_trigger_frames:
+                self._silence_triggered = True  # armar o gatilho
+        else:
+            if self._silence_triggered and not in_cooldown:
+                # Havia silêncio prolongado e agora voltou o áudio = troca de faixa
+                self._reset_song_state(
+                    f"silencio de {self._silence_frames * 50}ms seguido de audio"
+                )
+                self._silence_frames = 0
+                return
+            self._silence_frames = 0
+            self._silence_triggered = False
+
+        if is_silent or in_cooldown:
             return
 
+        # ── Detecção por similaridade de espectro (janela deslizante) ────────
         current = self._normalize_spectrum(spectrum)
         if not current:
             return
 
         if self._change_baseline is None:
-            self._change_baseline = current
-            self._change_bad_frames = 0
+            self._change_baseline = list(current)
+            self._change_window = []
             return
 
         sim = self._cosine_similarity(self._change_baseline, current)
-        if sim < self._change_similarity_threshold:
-            self._change_bad_frames += 1
-            if self._change_bad_frames >= self._change_frames_threshold:
-                _LOG.info(
-                    "Mudanca de musica detectada localmente (sim=%.2f, frames=%d). Forcando redeteccao.",
-                    sim,
-                    self._change_bad_frames,
+        is_divergent = sim < self._change_similarity_threshold
+
+        # Manter janela deslizante de tamanho fixo
+        self._change_window.append(is_divergent)
+        if len(self._change_window) > self._change_window_size:
+            self._change_window.pop(0)
+
+        # Disparar se mais de 60% dos frames na janela forem divergentes
+        if len(self._change_window) == self._change_window_size:
+            divergent_ratio = sum(self._change_window) / self._change_window_size
+            if divergent_ratio >= 0.6:
+                self._reset_song_state(
+                    f"espectro divergente (sim={sim:.2f}, ratio={divergent_ratio:.0%}, janela={self._change_window_size}f)"
                 )
-                self._last_change_trigger_at = now
-                self._current_song_key = None
-                self._current_song_duration_s = 0.0
-                self._miss_streak = 0
-                self._last_confidence = None
-                self._low_confidence_count = 0
-                self._change_baseline = None
-                self._change_bad_frames = 0
-                self._emit('song_not_found')
-        else:
-            self._change_bad_frames = 0
+                return
+
+        # Atualizar baseline via EMA apenas em frames não-divergentes
+        if not is_divergent:
             alpha = self._change_ema_alpha
-            if 0.0 < alpha < 1.0 and self._change_baseline is not None:
+            if 0.0 < alpha < 1.0:
                 base = self._change_baseline
                 for i in range(min(len(base), len(current))):
                     base[i] = (1.0 - alpha) * base[i] + alpha * current[i]
@@ -750,6 +833,10 @@ class RecognitionWorkerHeadless(threading.Thread):
                 self._lyrics_cache[song_key] = (lyrics_text, lyrics_result.synced)
                 self._emit('lyrics_ready', lyrics_text, lyrics_result.synced, capture_start)
                 
+                # 🎤 STT Sync: Atualizar letras e iniciar thread
+                self._update_stt_lyrics(lyrics_text)
+                self._start_stt_loop()
+                
                 # Update timecode
                 if result.timecode_ms is not None and result.timecode_ms > 0:
                     self._emit('timecode_updated', result.timecode_ms, capture_start)
@@ -779,3 +866,117 @@ class RecognitionWorkerHeadless(threading.Thread):
             self._emit('song_not_found')
         
         self._emit('status_changed', 'Aguardando música...')
+
+    # ─ STT Sync Integration (Fase 2) ──────────────────────────────────────
+
+    def _init_stt(self) -> None:
+        """Inicializa SpeechRecognizer e LyricsMatcher (lazy loading)."""
+        if not _STT_AVAILABLE or not self._stt_enabled:
+            return
+        
+        try:
+            model_size = self._config.get("SpeechSync", "model_size", fallback="tiny")
+            device = self._config.get("SpeechSync", "device", fallback="cuda")
+            min_similarity = self._config.getfloat("SpeechSync", "min_similarity", fallback=0.65)
+            
+            _LOG.info(f"🎤 STT Sync: Inicializando com model_size={model_size}, device={device}")
+            
+            self._stt_recognizer = SpeechRecognizer(model_size=model_size, device=device)
+            self._stt_matcher = LyricsMatcher(min_similarity=min_similarity)
+            
+            _LOG.info("🎤 STT Sync: Inicializado com sucesso")
+        except Exception as e:
+            _LOG.error(f"❌ Erro ao inicializar STT: {e}", exc_info=True)
+            self._stt_enabled = False
+
+    def _update_stt_lyrics(self, lyrics_text: str) -> None:
+        """Atualiza letras no matcher STT quando nova música é encontrada."""
+        if not self._stt_enabled or not self._stt_matcher:
+            return
+        
+        try:
+            # Parse lyrics_text em linhas
+            lines = [line.strip() for line in lyrics_text.split('\n') if line.strip()]
+            
+            with self._stt_lock:
+                self._current_lyrics_for_stt = lines
+                self._current_lyrics_index = 0
+            
+            self._stt_matcher.set_lyrics(lines)
+            _LOG.debug(f"🎤 STT: Letras atualizadas ({len(lines)} linhas)")
+        except Exception as e:
+            _LOG.error(f"❌ Erro ao atualizar lyrics STT: {e}")
+
+    def _start_stt_loop(self) -> None:
+        """Inicia thread de STT se não estiver rodando."""
+        if not self._stt_enabled or not self._stt_recognizer:
+            return
+        
+        if not self._stt_running:
+            self._stt_running = True
+            self._stt_thread = threading.Thread(
+                target=self._stt_loop,
+                daemon=True,
+                name="STTSync"
+            )
+            self._stt_thread.start()
+            _LOG.info("🎤 STT thread iniciada")
+
+    def _stop_stt_loop(self) -> None:
+        """Para thread de STT."""
+        self._stt_running = False
+        if self._stt_thread and self._stt_thread.is_alive():
+            self._stt_thread.join(timeout=2)
+
+    def _stt_loop(self) -> None:
+        """Loop principal de processamento STT (roda em thread separada)."""
+        chunk_duration = self._config.getfloat("SpeechSync", "chunk_duration_s", fallback=2.5)
+        
+        while self._stt_running and not self._stop_flag.is_set():
+            if self._pause_flag.is_set() or not self._current_lyrics_for_stt:
+                time.sleep(0.1)
+                continue
+            
+            try:
+                # Capturar chunk de áudio
+                audio_chunk = self._audio.capture_chunk(duration_s=chunk_duration)
+                
+                if audio_chunk is None or len(audio_chunk) == 0:
+                    time.sleep(0.1)
+                    continue
+                
+                # Reconhecer voz no chunk
+                segment = self._stt_recognizer.recognize_chunk(audio_chunk, sample_rate=44100)
+                
+                if not segment:
+                    continue
+                
+                # Emit reconhecimento para debug
+                self._emit('stt_recognized', segment.text, segment.confidence)
+                
+                # Encontrar match na letra
+                with self._stt_lock:
+                    current_index = self._current_lyrics_index
+                    lyrics = self._current_lyrics_for_stt
+                
+                if not lyrics:
+                    continue
+                
+                match = self._stt_matcher.find_best_match(segment.text, current_index=current_index)
+                
+                if match and match.similarity > 0.65:
+                    # Atualizar índice se modo não é timestamp_only
+                    if self._stt_mode in ("stt_only", "hybrid"):
+                        with self._stt_lock:
+                            old_index = self._current_lyrics_index
+                            self._current_lyrics_index = match.line_index
+                        
+                        if old_index != match.line_index:
+                            _LOG.debug(f"🎤 STT: Linha {old_index} → {match.line_index} (similarity: {match.similarity:.2%})")
+                            self._emit('stt_matched', match.line_index, match.similarity)
+                    
+                    self._stt_last_segment = segment
+            
+            except Exception as e:
+                _LOG.error(f"❌ Erro em STT loop: {e}", exc_info=True)
+                time.sleep(1)

@@ -8,9 +8,9 @@
 # UI framework
 PyQt6>=6.4.0
 
-# WASAPI loopback audio capture (Windows-only fork of PyAudio)
-# Docs: https://github.com/s0d3s/PyAudioWPatch
-pyaudiowpatch>=0.2.12.6
+# WASAPI loopback audio capture via FFmpeg (Windows)
+# Instalar: winget install ffmpeg  (ou baixar em https://ffmpeg.org/download.html)
+# ffmpeg deve estar no PATH — sem dependência Python
 
 # HTTP client for AudD, lrclib.net, Musixmatch
 requests>=2.31.0

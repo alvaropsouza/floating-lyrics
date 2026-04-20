@@ -270,6 +270,15 @@ class AudioCapture:
         )
         return wav_bytes
 
+    def capture_chunk(self, duration_s: float) -> bytes | None:
+        """Captura um chunk de áudio para STT (wrapper de capture)."""
+        try:
+            duration_int = max(1, int(duration_s))
+            return self.capture(duration_int)
+        except AudioCaptureError as e:
+            _LOG.warning(f"Erro ao capturar chunk STT: {e}")
+            return None
+
     # ── Spectrum capture ────────────────────────────────────────────────────
 
     def _start_spectrum_stream(self) -> None:
