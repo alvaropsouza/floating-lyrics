@@ -185,6 +185,7 @@ class HeadlessBackendServer:
         # Criar bridge (passa o event loop atual)
         self.loop = asyncio.get_running_loop()
         self.bridge = WebSocketBridgeHeadless(self.worker, self.loop, self.config)
+        self.ws_server.set_command_handler(self._handle_ws_command)
         
         # Configurar shutdown handler com asyncio (funciona melhor no Windows)
         shutdown_event = asyncio.Event()
@@ -221,6 +222,49 @@ class HeadlessBackendServer:
         # Aguardar até shutdown ser solicitado
         await shutdown_event.wait()
         await self.shutdown()
+
+    async def _handle_ws_command(self, command: str, _payload: dict) -> dict:
+        """Processa comandos de controle recebidos pelo WebSocket."""
+        if not self.worker:
+            return {
+                "ok": False,
+                "message": "Worker indisponível",
+            }
+
+        if command == "pause":
+            self.worker.pause()
+            await self.ws_server.emit_status("⏸️ Reconhecimento pausado")
+            return {"ok": True, "is_paused": True}
+
+        if command == "resume":
+            self.worker.resume()
+            await self.ws_server.emit_status("▶️ Retomando reconhecimento...")
+            return {"ok": True, "is_paused": False}
+
+        if command == "toggle_pause":
+            paused = self.worker.toggle_pause()
+            status = "⏸️ Reconhecimento pausado" if paused else "▶️ Retomando reconhecimento..."
+            await self.ws_server.emit_status(status)
+            return {"ok": True, "is_paused": paused}
+
+        if command == "get_runtime_status":
+            return {
+                "ok": True,
+                "is_paused": self.worker.is_paused(),
+                "is_debug_only": self.worker.is_debug_only(),
+            }
+
+        if command == "debug_only":
+            enabled = bool(_payload.get("enabled", True))
+            self.worker.set_debug_only(enabled)
+            status = "🔧 Modo debug: capturando áudio sem enviar para APIs" if enabled else "▶️ Retomando reconhecimento normal..."
+            await self.ws_server.emit_status(status)
+            return {"ok": True, "is_debug_only": enabled, "is_paused": False}
+
+        return {
+            "ok": False,
+            "message": f"Comando desconhecido: {command}",
+        }
 
     async def shutdown(self) -> None:
         """Shutdown gracioso."""

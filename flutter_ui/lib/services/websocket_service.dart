@@ -18,6 +18,8 @@ class WebSocketService extends ChangeNotifier {
   int _timecodeMs = 0;
   int? _localTimestamp; // Timestamp local (ms) quando recebeu o timecode
   bool _isConnected = false;
+  bool _isPaused = false;
+  bool _isDebugOnly = false;
   String? _error;
   List<double> _audioSpectrum = List.filled(32, 0.0);
   int _lastSpectrumNotifyTime = 0;
@@ -28,6 +30,8 @@ class WebSocketService extends ChangeNotifier {
   LyricsData? get lyrics => _lyrics;
   int get timecodeMs => _timecodeMs;
   bool get isConnected => _isConnected;
+  bool get isPaused => _isPaused;
+  bool get isDebugOnly => _isDebugOnly;
   String? get error => _error;
   List<double> get audioSpectrum => _audioSpectrum;
 
@@ -54,6 +58,8 @@ class WebSocketService extends ChangeNotifier {
         onError: _handleError,
         onDone: _handleDisconnect,
       );
+
+      sendMessage('get_runtime_status', {});
 
       debugPrint('WebSocket conectado: $_wsUrl');
       notifyListeners();
@@ -87,6 +93,28 @@ class WebSocketService extends ChangeNotifier {
 
         case 'status_changed':
           _status = payload?['status'] ?? '';
+          break;
+
+        case 'runtime_state':
+          _isPaused = payload?['is_paused'] as bool? ?? false;
+          if (payload != null && payload['is_debug_only'] is bool) {
+            _isDebugOnly = payload['is_debug_only'] as bool;
+          }
+          break;
+
+        case 'command_result':
+          final ok = payload?['ok'] as bool? ?? false;
+          if (!ok) {
+            _error =
+                payload?['message'] as String? ?? 'Falha ao executar comando';
+            _status = '⚠️ $_error';
+          }
+          if (payload != null && payload['is_paused'] is bool) {
+            _isPaused = payload['is_paused'] as bool;
+          }
+          if (payload != null && payload['is_debug_only'] is bool) {
+            _isDebugOnly = payload['is_debug_only'] as bool;
+          }
           break;
 
         case 'song_found':
@@ -187,6 +215,8 @@ class WebSocketService extends ChangeNotifier {
   void _handleDisconnect() {
     debugPrint('WebSocket desconectado');
     _isConnected = false;
+    _isPaused = false;
+    _isDebugOnly = false;
     _status = 'Desconectado';
     notifyListeners();
 
@@ -209,6 +239,26 @@ class WebSocketService extends ChangeNotifier {
 
   void ping() {
     sendMessage('ping', {});
+  }
+
+  void togglePause() {
+    sendMessage('toggle_pause', {});
+  }
+
+  void pause() {
+    sendMessage('pause', {});
+  }
+
+  void resume() {
+    sendMessage('resume', {});
+  }
+
+  void setDebugOnly(bool enabled) {
+    sendMessage('debug_only', {'enabled': enabled});
+  }
+
+  void toggleDebugOnly() {
+    setDebugOnly(!_isDebugOnly);
   }
 
   @override

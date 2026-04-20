@@ -60,10 +60,10 @@ class FloatingLyricsApp extends StatelessWidget {
           useMaterial3: true,
           brightness: Brightness.dark,
           colorScheme: ColorScheme.fromSeed(
-            seedColor: const Color(0xFF6366F1),
+            seedColor: const Color(0xFF0EA5A4),
             brightness: Brightness.dark,
           ),
-          scaffoldBackgroundColor: const Color(0xFF1A1A2E),
+          scaffoldBackgroundColor: const Color(0xFF0A0F17),
         ),
         home: const HomeScreen(),
       ),

@@ -1,32 +1,31 @@
 """
-Captura de áudio via WASAPI loopback (saída do sistema, não microfone).
+Captura de áudio via PyAudioWPatch + WASAPI loopback (saída do sistema, não microfone).
 
-Dependência: pyaudiowpatch — fork do PyAudio com suporte nativo a WASAPI
-loopback no Windows.  Instale com:  pip install pyaudiowpatch
+Dependência: pyaudiowpatch
+  pip install pyaudiowpatch
+
+Funciona exclusivamente no Windows via WASAPI loopback.
 """
 
 import io
 import logging
 import threading
-import time
 import wave
 from typing import Optional
 
 _LOG = logging.getLogger(__name__)
 
 try:
-    import numpy as _np
-    _NUMPY_AVAILABLE = True
-except ImportError:
-    import math
-    import struct
-    _NUMPY_AVAILABLE = False
-
-try:
-    import pyaudiowpatch as pyaudio  # type: ignore
+    import pyaudiowpatch as pyaudio
     _PYAUDIO_AVAILABLE = True
 except ImportError:
     _PYAUDIO_AVAILABLE = False
+
+try:
+    import numpy as _np
+    _NUMPY_AVAILABLE = True
+except ImportError:
+    _NUMPY_AVAILABLE = False
 
 
 class AudioCaptureError(Exception):
@@ -35,608 +34,351 @@ class AudioCaptureError(Exception):
 
 class AudioCapture:
     """
-    Captures the Windows system audio output (loopback) using WASAPI.
+    Captures Windows system audio output (loopback) using PyAudioWPatch + WASAPI.
 
     Usage::
 
         cap = AudioCapture(config)
-        cap.initialize()          # call once at startup
-        wav_bytes = cap.capture(10)   # capture 10 s → WAV bytes
-        cap.cleanup()             # call on exit
+        cap.initialize()              # call once at startup
+        wav_bytes = cap.capture(10)   # capture 10 s -> WAV bytes
+        cap.cleanup()                 # call on exit
     """
+
+    # Parâmetros fixos de captura
+    _CAPTURE_CHANNELS = 2
+    _FRAMES_PER_BUFFER = 1024
+
+    # Parâmetros do espectro
+    _SPECTRUM_BUFFER_MS = 300
 
     def __init__(self, config) -> None:
         self._config = config
-        self._pa: Optional[object] = None          # instância usada em capture()
-        self._pa_spectrum: Optional[object] = None # instância SEPARADA para espectro
-        self._lock = threading.RLock()             # lock exclusivo para capture()
-        self._spectrum_lock = threading.Lock()     # lock exclusivo para capture_spectrum()
-        self._capture_active = threading.Event()   # evita contencao do loopback durante capture()
-        self._last_spectrum: list[float] = [0.0] * 32  # Cache do último espectro
-        self._spectrum_cache_hits = 0  # Contador de cache hits consecutivos
-        self._shutdown_flag: Optional[threading.Event] = None  # Flag para interromper captura
+        self._pa: Optional[object] = None
+        self._pa_spectrum: Optional[object] = None
+        self._device_info: Optional[dict] = None
+        self._sample_format = None
+
+        self._lock = threading.RLock()
+        self._capture_active = threading.Event()
+        self._shutdown_flag: Optional[threading.Event] = None
+
+        self._spectrum_lock = threading.Lock()
+        self._spectrum_stream = None
+        self._spectrum_buf: bytes = b""
+        self._spectrum_buf_lock = threading.Lock()
+        self._spectrum_reader: Optional[threading.Thread] = None
+        self._spectrum_running = False
+        self._last_spectrum: list[float] = [0.0] * 32
+        self._spectrum_sample_rate: int = 44100
+        self._spectrum_channels: int = 2
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
     def set_shutdown_flag(self, flag: threading.Event) -> None:
-        """Define a flag de shutdown que será verificada durante a captura."""
         self._shutdown_flag = flag
 
     def initialize(self) -> None:
-        """
-        Initialise PyAudio and verify that a WASAPI loopback device exists.
-
-        Raises:
-            AudioCaptureError: if pyaudiowpatch is missing or no loopback
-                device is found.
-        """
+        """Inicializa PyAudio e verifica dispositivo de loopback WASAPI."""
         if not _PYAUDIO_AVAILABLE:
             raise AudioCaptureError(
                 "pyaudiowpatch não está instalado.\n"
-                "Execute no terminal:  pip install pyaudiowpatch"
+                "Execute no terminal: pip install pyaudiowpatch"
             )
+
         self._pa = pyaudio.PyAudio()
-        # Instância separada para espectro — sem conflito de lock com capture()
         self._pa_spectrum = pyaudio.PyAudio()
-        # Probe the loopback device early so the error surfaces at startup.
-        self._get_loopback_device()
+        self._sample_format = pyaudio.paInt16
+
+        self._device_info = self._get_loopback_device()
+        _LOG.info(
+            "AudioCapture (WASAPI) inicializado. Dispositivo: %s (idx=%d, %dHz, %dch)",
+            self._device_info["name"],
+            self._device_info["index"],
+            int(self._device_info["defaultSampleRate"]),
+            min(int(self._device_info["maxInputChannels"]), self._CAPTURE_CHANNELS),
+        )
+        self._start_spectrum_stream()
 
     def cleanup(self) -> None:
-        """Release PyAudio resources."""
-        if self._pa is not None:
+        """Para o stream de espectro e libera PyAudio."""
+        self._spectrum_running = False
+        # Aguardar thread do spectrum encerrar antes de fechar o stream
+        reader = self._spectrum_reader
+        if reader is not None and reader.is_alive():
+            reader.join(timeout=2.0)
+        self._stop_spectrum_stream()
+        # Terminar PyAudio do espectro primeiro (não tem stream aberto mais)
+        pa_spectrum = self._pa_spectrum
+        self._pa_spectrum = None
+        if pa_spectrum is not None:
             try:
-                self._pa.terminate()
+                pa_spectrum.terminate()
             except Exception:
-                _LOG.debug("Erro ao terminar PyAudio", exc_info=True)
-            finally:
-                self._pa = None
-        if self._pa_spectrum is not None:
+                pass
+        # Depois o PyAudio principal
+        pa = self._pa
+        self._pa = None
+        if pa is not None:
             try:
-                self._pa_spectrum.terminate()
+                pa.terminate()
             except Exception:
-                _LOG.debug("Erro ao terminar PyAudio (espectro)", exc_info=True)
-            finally:
-                self._pa_spectrum = None
+                pass
 
     # ── Device discovery ────────────────────────────────────────────────────
 
     def _list_loopback_devices(self) -> list[dict]:
-        devices: list[dict] = []
+        devices = []
         try:
             for dev in self._pa.get_loopback_device_info_generator():
                 devices.append(dev)
-        except Exception:
-            _LOG.warning("Falha ao listar dispositivos loopback", exc_info=True)
-            return []
+        except Exception as exc:
+            _LOG.warning("Falha ao listar loopback devices: %s", exc)
         return devices
 
     def _preferred_loopback_device(self) -> Optional[dict]:
-        """
-        Resolve a user-preferred loopback device by index or partial name.
+        preferred_idx = self._config.getint("Audio", "capture_device_index", fallback=-1)
+        preferred_name = self._config.get("Audio", "capture_device_name", fallback="").strip()
 
-        Config keys (section [Audio]):
-          - capture_device_index (int, default -1)
-          - capture_device_name (string, partial match)
-        """
-        loopbacks = self._list_loopback_devices()
-        if not loopbacks:
+        if preferred_idx < 0 and not preferred_name:
             return None
 
-        preferred_idx = self._config.getint("Audio", "capture_device_index", fallback=-1)
+        devices = self._list_loopback_devices()
+
         if preferred_idx >= 0:
-            for dev in loopbacks:
-                if int(dev.get("index", -1)) == preferred_idx:
+            for dev in devices:
+                if int(dev["index"]) == preferred_idx:
                     return dev
-            available = ", ".join(str(int(dev.get("index", -1))) for dev in loopbacks)
+            available = ", ".join(f"{int(d['index'])}: {d['name']}" for d in devices)
             raise AudioCaptureError(
-                "capture_device_index inválido no config.ini. "
-                f"Índices disponíveis: {available}"
+                f"capture_device_index {preferred_idx} inválido. Disponíveis: {available}"
             )
 
-        preferred_name = self._config.get("Audio", "capture_device_name", fallback="").strip().lower()
         if preferred_name:
-            for dev in loopbacks:
-                name = str(dev.get("name", "")).lower()
-                if preferred_name in name:
+            lower = preferred_name.lower()
+            for dev in devices:
+                if lower in dev["name"].lower():
                     return dev
-            names = "; ".join(str(dev.get("name", "")) for dev in loopbacks)
+            names = "; ".join(d["name"] for d in devices)
             raise AudioCaptureError(
-                "capture_device_name não encontrado no config.ini. "
-                f"Dispositivos loopback disponíveis: {names}"
+                f"capture_device_name '{preferred_name}' não encontrado. Disponíveis: {names}"
             )
 
         return None
 
     def _get_loopback_device(self) -> dict:
-        """
-        Return the WASAPI loopback device info dict for the current default
-        audio output.
-
-        Raises:
-            AudioCaptureError: if WASAPI is unavailable or no loopback device
-                is found.
-        """
+        """Resolve o dispositivo de loopback WASAPI a usar."""
         preferred = self._preferred_loopback_device()
-        if preferred is not None:
+        if preferred:
             return preferred
 
         try:
             wasapi_info = self._pa.get_host_api_info_by_type(pyaudio.paWASAPI)
         except OSError:
             raise AudioCaptureError(
-                "WASAPI não está disponível neste sistema.\n"
-                "Este recurso requer Windows Vista ou superior com drivers WASAPI."
+                "WASAPI não disponível. Verifique se o driver de áudio suporta WASAPI."
             )
 
-        default_out_idx: int = wasapi_info.get("defaultOutputDevice", -1)
+        default_out_idx = wasapi_info.get("defaultOutputDevice", -1)
         if default_out_idx < 0:
-            raise AudioCaptureError(
-                "Nenhum dispositivo de saída de áudio padrão encontrado.\n"
-                "Verifique se há alto-falantes ou fones conectados."
-            )
+            raise AudioCaptureError("Nenhum dispositivo de saída padrão encontrado.")
 
         default_out = self._pa.get_device_info_by_index(default_out_idx)
 
-        # Some drivers already expose the loopback variant directly.
-        if default_out.get("isLoopbackDevice", False):
-            return default_out
+        for loopback in self._pa.get_loopback_device_info_generator():
+            if loopback["name"].startswith(default_out["name"]):
+                return loopback
 
-        # Search among all loopback devices for the one matching our output.
-        try:
-            for loopback in self._pa.get_loopback_device_info_generator():
-                if default_out["name"] in loopback["name"]:
-                    return loopback
-        except Exception:
-            pass
+        devices = self._list_loopback_devices()
+        if devices:
+            _LOG.warning(
+                "Nenhum loopback exato para '%s'. Usando: %s",
+                default_out["name"], devices[0]["name"],
+            )
+            return devices[0]
 
         raise AudioCaptureError(
-            f"Nenhum dispositivo de loopback encontrado para "
-            f"'{default_out['name']}'.\n"
-            "Certifique-se de que o dispositivo de saída está ativo e "
-            "tente reiniciar o aplicativo."
+            "Nenhum dispositivo de loopback WASAPI encontrado.\n"
+            "Verifique se há um dispositivo de saída de áudio ativo no Windows."
         )
 
-    # ── Silence detection / normalization ───────────────────────────────────
-
-    @staticmethod
-    def _rms(raw_bytes: bytes) -> float:
-        """Compute Root-Mean-Square of 16-bit little-endian PCM samples."""
-        if not raw_bytes:
-            return 0.0
-        if _NUMPY_AVAILABLE:
-            samples = _np.frombuffer(raw_bytes, dtype="<i2").astype(_np.float32)
-            return float(_np.sqrt(_np.mean(samples ** 2)))
-        # Pure-Python fallback
-        import math, struct
-        count = len(raw_bytes) // 2
-        shorts = struct.unpack_from(f"<{count}h", raw_bytes)
-        return math.sqrt(sum(s * s for s in shorts) / count)
-
-    def _normalize(self, raw_bytes: bytes) -> bytes:
-        """
-        Scale 16-bit PCM with conservative gain to improve recognition while
-        avoiding hiss/distortion caused by over-amplifying background noise.
-        """
-        if not raw_bytes:
-            return raw_bytes
-        max_gain = self._config.getfloat("Audio", "max_normalize_gain", fallback=3.0)
-        target_peak = 22000.0
-        if _NUMPY_AVAILABLE:
-            samples = _np.frombuffer(raw_bytes, dtype="<i2").astype(_np.float32)
-            peak = float(_np.abs(samples).max())
-            if peak < 10 or peak >= 28000:
-                return raw_bytes
-            gain = min(target_peak / peak, max_gain)
-            if gain <= 1.0:
-                return raw_bytes
-            return _np.clip(samples * gain, -32768, 32767).astype("<i2").tobytes()
-        # Pure-Python fallback
-        import struct
-        count = len(raw_bytes) // 2
-        fmt = f"<{count}h"
-        samples = struct.unpack_from(fmt, raw_bytes)
-        peak = max(abs(s) for s in samples)
-        if peak < 10 or peak >= 28000:
-            return raw_bytes
-        gain = min(target_peak / peak, max_gain)
-        if gain <= 1.0:
-            return raw_bytes
-        return bytes(struct.pack(fmt, *(max(-32768, min(32767, int(s * gain))) for s in samples)))
-
-    @staticmethod
-    def _peak(raw_bytes: bytes) -> float:
-        """Compute absolute peak of 16-bit little-endian PCM samples."""
-        if not raw_bytes:
-            return 0.0
-        if _NUMPY_AVAILABLE:
-            samples = _np.frombuffer(raw_bytes, dtype="<i2").astype(_np.float32)
-            return float(_np.abs(samples).max()) if samples.size else 0.0
-        import struct
-        count = len(raw_bytes) // 2
-        shorts = struct.unpack_from(f"<{count}h", raw_bytes)
-        return float(max(abs(s) for s in shorts)) if shorts else 0.0
-
-    def _downmix_to_mono(self, raw_audio: bytes, channels: int) -> tuple[bytes, int]:
-        """Convert PCM 16-bit audio to mono for more stable fingerprinting."""
-        if not raw_audio or channels <= 1:
-            return raw_audio, 1
-        try:
-            if _NUMPY_AVAILABLE:
-                samples = _np.frombuffer(raw_audio, dtype="<i2")
-                if samples.size == 0:
-                    return raw_audio, 1
-                mono = samples.reshape(-1, channels).astype(_np.float32).mean(axis=1)
-                return _np.clip(mono, -32768, 32767).astype("<i2").tobytes(), 1
-            import struct
-            count = len(raw_audio) // 2
-            shorts = struct.unpack_from(f"<{count}h", raw_audio)
-            frames = len(shorts) // channels
-            mixed = []
-            for idx in range(frames):
-                frame = shorts[idx * channels:(idx + 1) * channels]
-                mixed.append(int(sum(frame) / max(1, len(frame))))
-            return struct.pack(f"<{len(mixed)}h", *mixed), 1
-        except Exception as exc:
-            _LOG.warning("Falha no downmix para mono: %s", exc)
-            return raw_audio, channels
-
-    def _resample_if_needed(self, raw_audio: bytes, in_rate: int, channels: int) -> tuple[bytes, int]:
-        """Optionally resample to a configured target rate for stable timing."""
-        target_rate = self._config.getint("Audio", "target_sample_rate", fallback=44100)
-        if target_rate <= 0 or target_rate == in_rate:
-            return raw_audio, in_rate
-        try:
-            if not _NUMPY_AVAILABLE:
-                _LOG.warning(
-                    "Resample desativado: NumPy não disponível (mantendo %dHz)",
-                    in_rate,
-                )
-                return raw_audio, in_rate
-
-            samples = _np.frombuffer(raw_audio, dtype="<i2")
-            if samples.size == 0:
-                return raw_audio, in_rate
-
-            if channels > 1:
-                samples_2d = samples.reshape(-1, channels)
-                in_len = samples_2d.shape[0]
-                out_len = max(1, int(round(in_len * (target_rate / in_rate))))
-                x_old = _np.arange(in_len, dtype=_np.float64)
-                x_new = _np.linspace(0, in_len - 1, out_len, dtype=_np.float64)
-
-                out = _np.empty((out_len, channels), dtype=_np.float32)
-                for ch in range(channels):
-                    out[:, ch] = _np.interp(x_new, x_old, samples_2d[:, ch])
-                converted = _np.clip(out, -32768, 32767).astype("<i2").reshape(-1).tobytes()
-            else:
-                in_len = samples.shape[0]
-                out_len = max(1, int(round(in_len * (target_rate / in_rate))))
-                x_old = _np.arange(in_len, dtype=_np.float64)
-                x_new = _np.linspace(0, in_len - 1, out_len, dtype=_np.float64)
-                out = _np.interp(x_new, x_old, samples.astype(_np.float32))
-                converted = _np.clip(out, -32768, 32767).astype("<i2").tobytes()
-
-            _LOG.info("Resample de %dHz para %dHz aplicado", in_rate, target_rate)
-            return converted, target_rate
-        except Exception as exc:
-            _LOG.warning("Falha no resample (%d -> %d): %s", in_rate, target_rate, exc)
-            return raw_audio, in_rate
-
-    # ── Capture ─────────────────────────────────────────────────────────────
-
-    def capture_spectrum(self, duration_ms: int = 100, num_bars: int = 32) -> list[float]:
-        """
-        Captura um snapshot rápido de áudio e retorna espectro de frequências.
-        
-        Usa instância PyAudio própria (_pa_spectrum) — nunca compete com capture().
-        """
-        if self._capture_active.is_set():
-            return self._last_spectrum.copy()
-
-        # Lock próprio do espectro — totalmente independente do lock de capture()
-        acquired = self._spectrum_lock.acquire(blocking=False)
-        if not acquired:
-            # Outra chamada de espectro ainda rodando — retornar cache sem decay
-            return self._last_spectrum.copy()
-        
-        try:
-            spectrum = self._capture_spectrum_unsafe(duration_ms, num_bars)
-            self._last_spectrum = spectrum.copy()
-            self._spectrum_cache_hits = 0
-            return spectrum
-        finally:
-            self._spectrum_lock.release()
-    
-    def _capture_spectrum_unsafe(self, duration_ms: int = 100, num_bars: int = 32) -> list[float]:
-        """Versão sem lock - usada internamente após adquirir lock de espectro."""
-        if self._pa_spectrum is None:
-            # Fallback para _pa se espectro não inicializado
-            if self._pa is None:
-                return [0.0] * num_bars
-            pa = self._pa
-        else:
-            pa = self._pa_spectrum
-        
-        try:
-            device = self._get_loopback_device()
-            sample_rate: int = int(device["defaultSampleRate"])
-            channels: int = min(int(device["maxInputChannels"]), 2) or 1
-            
-            chunk = 512  # Chunk menor para captura mais rápida
-            
-            # Abrir stream de forma mais tolerante a erros
-            stream = None
-            try:
-                stream = pa.open(
-                    format=pyaudio.paInt16,
-                    channels=channels,
-                    rate=sample_rate,
-                    input=True,
-                    input_device_index=int(device["index"]),
-                    frames_per_buffer=chunk,
-                )
-                
-                # Capturar apenas 2 chunks (~20ms) para ser bem rápido
-                frames = []
-                for _ in range(2):
-                    data = stream.read(chunk, exception_on_overflow=False)
-                    frames.append(data)
-
-                raw_audio = b"".join(frames)
-                
-            except Exception as stream_exc:
-                _LOG.debug(f"Failed to capture spectrum audio: {stream_exc}")
-                return [0.0] * num_bars
-            finally:
-                if stream is not None:
-                    try:
-                        stream.stop_stream()
-                        stream.close()
-                    except Exception:
-                        pass
-            
-            # Calcular espectro usando FFT
-            if len(raw_audio) == 0:
-                return [0.0] * num_bars
-                
-            # Calcular FFT
-            if _NUMPY_AVAILABLE:
-                samples = _np.frombuffer(raw_audio, dtype="<i2").astype(_np.float32)
-                
-                # Se stereo, pegar apenas um canal
-                if channels > 1:
-                    samples = samples[::channels]
-                
-                # Aplicar FFT
-                fft_data = _np.abs(_np.fft.rfft(samples))
-                
-                # Limitar espectro FFT para frequências musicais (até ~16kHz)
-                # Acima disso há pouca/nenhuma energia em música comum
-                # Usar apenas os primeiros 66% dos bins FFT (~16kHz de 24kHz)
-                spectrum_size = int(len(fft_data) * 0.66)
-                fft_data = fft_data[:spectrum_size]
-                
-                bars = []
-                
-                for i in range(num_bars):
-                    # Mapeamento logarítmico bem suave (expoente 1.3)
-                    # Distribui: graves (esquerda), médios (centro), agudos (direita)
-                    start_idx = int((i / num_bars) ** 1.3 * spectrum_size)
-                    end_idx = int(((i + 1) / num_bars) ** 1.3 * spectrum_size)
-                    end_idx = max(start_idx + 1, end_idx)
-                    
-                    # Média da banda
-                    band_avg = float(_np.mean(fft_data[start_idx:end_idx]))
-                    
-                    # Boost progressivo para frequências altas (elas têm menos energia naturalmente)
-                    # Últimas 30% das barras recebem boost crescente
-                    if i > num_bars * 0.7:
-                        boost = 1.0 + (i - num_bars * 0.7) / (num_bars * 0.3) * 2.0  # até 3x
-                        band_avg *= boost
-                    
-                    bars.append(band_avg)
-                
-                # Verificar nível geral de áudio ANTES de normalizar
-                max_raw = max(bars) if bars else 0.0
-                
-                # Se o nível geral é muito baixo, retornar zeros (sem áudio/apenas ruído)
-                if max_raw < 1000:  # Threshold absoluto para ruído de fundo
-                    return [0.0] * num_bars
-                
-                # Normalizar para [0.0, 1.0]
-                if bars and max_raw > 0:
-                    bars = [min(1.0, b / max_raw * 1.5) for b in bars]  # 1.5x para dar dinâmica
-                    
-                    # Noise gate reduzido para permitir agudos mais baixos
-                    bars = [b if b > 0.10 else 0.0 for b in bars]
-                
-                return bars
-            else:
-                # Fallback sem numpy: retornar valores baseados em RMS
-                rms = self._rms(raw_audio)
-                base_level = min(1.0, rms / 5000.0)
-                return [base_level] * num_bars
-                
-        except Exception as exc:
-            _LOG.debug(f"Erro ao capturar espectro: {exc}")
-            return [0.0] * num_bars
+    # ── Main capture ────────────────────────────────────────────────────────
 
     def capture(self, duration: int) -> bytes:
-        """
-        Record *duration* seconds of system audio via WASAPI loopback.
-
-        Returns:
-            WAV-formatted bytes suitable for sending to a recognition API.
-
-        Raises:
-            AudioCaptureError: if the capture device is unavailable, no
-                audio is detected (silence), or any other recording error.
-        """
-        # Lock para evitar acesso simultâneo ao WASAPI
+        """Captura áudio do sistema por `duration` segundos. Retorna WAV bytes."""
         with self._lock:
             self._capture_active.set()
             try:
                 return self._capture_unsafe(duration)
             finally:
                 self._capture_active.clear()
-    
+
     def _capture_unsafe(self, duration: int) -> bytes:
-        """Versão sem lock - usada internamente após adquirir lock."""
         if self._pa is None:
-            raise AudioCaptureError(
-                "AudioCapture não foi inicializado. Chame initialize() antes."
-            )
+            raise AudioCaptureError("AudioCapture não inicializado.")
 
-        device = self._get_loopback_device()
-        sample_rate: int = int(device["defaultSampleRate"])
-        channels: int = min(int(device["maxInputChannels"]), 2) or 1
-        frames: list[bytes] = []
+        dev = self._device_info
+        sample_rate = int(dev["defaultSampleRate"])
+        channels = min(int(dev["maxInputChannels"]), self._CAPTURE_CHANNELS) or 1
 
-        # Buffer size configurável via config.ini (padrão: 0.1s = ~100ms de latência)
-        # Buffers maiores = menos pipocos, mas maior latência
-        buffer_duration_ms = self._config.getfloat("Audio", "buffer_duration_ms", fallback=100.0)
-        preferred_chunk = int(sample_rate * (buffer_duration_ms / 1000.0))
-        
-        # Let the WASAPI driver pick the optimal buffer size first (0 = unspecified).
-        # Fall back to explicit sizes if the driver rejects paFramesPerBufferUnspecified.
-        # Ordem: auto (0) > configurado > tamanhos crescentes (evitar buffers muito pequenos)
-        chunk_candidates = [0, preferred_chunk, 2048, 4096, 8192, 16384]
-        # Remover duplicatas e valores inválidos
-        chunk_candidates = sorted(set(c for c in chunk_candidates if c == 0 or c >= 512))
-        
-        stream = None
-        last_exc: Exception | None = None
-        used_chunk = 0
-        
-        for chunk in chunk_candidates:
-            try:
-                stream = self._pa.open(
-                    format=pyaudio.paInt16,
-                    channels=channels,
-                    rate=sample_rate,
-                    input=True,
-                    input_device_index=int(device["index"]),
-                    frames_per_buffer=chunk,
-                )
-                used_chunk = chunk
-                _LOG.debug("Stream WASAPI aberto com chunk=%d (%.1fms buffer)", 
-                          chunk, (chunk / sample_rate * 1000.0) if chunk > 0 else 0.0)
-                break
-            except OSError as exc:
-                _LOG.debug("Falha ao abrir stream com chunk=%d: %s", chunk, exc)
-                last_exc = exc
-                # Re-initialize PyAudio for the next attempt — a failed open can
-                # leave the WASAPI handle in a broken state.
-                try:
-                    self._pa.terminate()
-                except Exception:
-                    pass
-                self._pa = pyaudio.PyAudio()
-
-        if stream is None:
-            raise AudioCaptureError(
-                f"Não foi possível abrir o stream de áudio após {len(chunk_candidates)} tentativas.\n"
-                f"Último erro: {last_exc}\n"
-                "Tente trocar o dispositivo de saída de áudio ou reiniciar o aplicativo."
-            )
-
-        # Use chunk adaptativo: se driver escolheu (chunk=0), usar 2048; senão usar o chunk negociado
-        read_chunk = 2048 if used_chunk == 0 else used_chunk
-        capture_started_at = 0.0
-        capture_elapsed_s = 0.0
-        overflow_count = 0
-        
         try:
-            total_chunks = max(1, round((sample_rate / read_chunk) * duration))
-            capture_started_at = time.perf_counter()
-            
-            for chunk_idx in range(total_chunks):
-                # Verificar se foi solicitado shutdown antes de cada chunk
-                if self._shutdown_flag and self._shutdown_flag.is_set():
-                    _LOG.debug("Captura de áudio interrompida por shutdown (chunk %d/%d)", chunk_idx, total_chunks)
-                    raise AudioCaptureError("Captura interrompida por shutdown")
-                
-                try:
-                    # Leitura não-bloqueante com detecção de overflow
-                    data = stream.read(read_chunk, exception_on_overflow=False)
-                    frames.append(data)
-                except OSError as read_exc:
-                    # Overflow detectado: logar mas continuar (áudio já tem gaps)
-                    overflow_count += 1
-                    _LOG.debug("Buffer overflow no chunk %d/%d: %s", chunk_idx, total_chunks, read_exc)
-                    # Adicionar silêncio para manter sincronismo temporal
-                    frames.append(b'\x00\x00' * read_chunk * channels)
-                    
-            capture_elapsed_s = max(0.001, time.perf_counter() - capture_started_at)
-            
-            if overflow_count > 0:
-                _LOG.warning(
-                    "Detectados %d buffer overflows durante captura (%.1f%% dos chunks). "
-                    "Aumente buffer_duration_ms no config.ini para reduzir pipocos.",
-                    overflow_count,
-                    (overflow_count / total_chunks * 100.0)
-                )
+            stream = self._pa.open(
+                format=self._sample_format,
+                channels=channels,
+                rate=sample_rate,
+                input=True,
+                input_device_index=int(dev["index"]),
+                frames_per_buffer=self._FRAMES_PER_BUFFER,
+            )
         except OSError as exc:
-            raise AudioCaptureError(f"Erro durante a gravação: {exc}") from exc
+            raise AudioCaptureError(f"Falha ao abrir stream de captura: {exc}") from exc
+
+        frames: list[bytes] = []
+        total_frames = int(sample_rate * duration)
+        captured = 0
+
+        try:
+            while captured < total_frames:
+                if self._shutdown_flag and self._shutdown_flag.is_set():
+                    raise AudioCaptureError("Captura interrompida por shutdown")
+                to_read = min(self._FRAMES_PER_BUFFER, total_frames - captured)
+                try:
+                    chunk = stream.read(to_read, exception_on_overflow=False)
+                except OSError as exc:
+                    _LOG.warning("Overflow durante captura: %s", exc)
+                    break
+                frames.append(chunk)
+                captured += to_read
         finally:
             stream.stop_stream()
             stream.close()
 
-        raw_audio = b"".join(frames)
-        captured_channels = channels
-
-        # Estimate the effective sample rate from captured byte count. Some
-        # WASAPI drivers may report/open at one rate but deliver data at
-        # another, which makes the WAV play accelerated/slow if the header
-        # uses only the nominal rate.
-        # Keep the device sample rate in the WAV header. Estimating an
-        # "effective" rate from wall-clock time is too noisy here and can
-        # introduce audible artifacts when we resample afterward.
-        effective_rate = sample_rate
-        if captured_channels > 0:
-            bytes_per_sample = 2  # paInt16
-            total_samples = len(raw_audio) / (captured_channels * bytes_per_sample)
-            reference_window_s = capture_elapsed_s if capture_elapsed_s > 0 else max(0.001, float(duration))
-            estimated_rate = int(round(total_samples / reference_window_s))
-            if 8000 <= estimated_rate <= 192000:
-                deviation = abs(estimated_rate - sample_rate) / max(sample_rate, 1)
-                if deviation >= 0.10:
-                    _LOG.warning(
-                        "Taxa nominal=%dHz e estimada=%dHz divergiram %.1f%% (janela=%.3fs). "
-                        "Mantendo taxa nominal no WAV para evitar reamostragem incorreta.",
-                        sample_rate,
-                        estimated_rate,
-                        deviation * 100,
-                        reference_window_s,
-                    )
-
-        # ── Silence check (before normalization, on raw signal) ─────────────
-        # Use a very low threshold here — just enough to reject true silence.
-        # The actual normalization will happen next, so the API always gets
-        # a loud signal regardless of system volume.
-        raw_audio, channels = self._downmix_to_mono(raw_audio, channels)
-        silence_threshold = self._config.getfloat("Recognition", "silence_threshold", fallback=30.0)
-        raw_rms = self._rms(raw_audio)
-        raw_peak = self._peak(raw_audio)
-        _LOG.debug("RMS do áudio bruto: %.1f", raw_rms)
-        if raw_rms < silence_threshold and raw_peak < (silence_threshold * 4):
+        if not frames:
             raise AudioCaptureError(
-                f"Nenhum áudio detectado no sistema (RMS = {raw_rms:.1f}).\n"
-                "Verifique se algo está tocando."
+                "Nenhum frame capturado. Verifique se algo está tocando no sistema."
             )
 
-        # ── Normalize with conservative gain (avoid hiss) ────────────────────
-        raw_audio = self._normalize(raw_audio)
-
-        # ── Optional resample to stable target rate ──────────────────────────
-        raw_audio, effective_rate = self._resample_if_needed(raw_audio, effective_rate, channels)
-
-        # ── Encode as WAV ───────────────────────────────────────────────────
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(channels)
-            wf.setsampwidth(self._pa.get_sample_size(pyaudio.paInt16))
-            wf.setframerate(effective_rate)
-            wf.writeframes(raw_audio)
+            wf.setsampwidth(self._pa.get_sample_size(self._sample_format))
+            wf.setframerate(sample_rate)
+            wf.writeframes(b"".join(frames))
+        wav_bytes = buf.getvalue()
+        _LOG.debug(
+            "Captura WASAPI: %d bytes WAV (taxa=%dHz, canais=%d)",
+            len(wav_bytes), sample_rate, channels,
+        )
+        return wav_bytes
 
-        return buf.getvalue()
+    # ── Spectrum capture ────────────────────────────────────────────────────
+
+    def _start_spectrum_stream(self) -> None:
+        try:
+            dev = self._device_info
+            sample_rate = int(dev["defaultSampleRate"])
+            channels = min(int(dev["maxInputChannels"]), self._CAPTURE_CHANNELS) or 1
+
+            self._spectrum_stream = self._pa_spectrum.open(
+                format=self._sample_format,
+                channels=channels,
+                rate=sample_rate,
+                input=True,
+                input_device_index=int(dev["index"]),
+                frames_per_buffer=self._FRAMES_PER_BUFFER,
+            )
+            self._spectrum_running = True
+            self._spectrum_sample_rate = sample_rate
+            self._spectrum_channels = channels
+
+            self._spectrum_reader = threading.Thread(
+                target=self._spectrum_reader_loop,
+                daemon=True,
+                name="SpectrumReader",
+            )
+            self._spectrum_reader.start()
+            _LOG.info("Stream de espectro iniciado (%dHz, %dch)", sample_rate, channels)
+
+        except Exception as exc:
+            _LOG.warning("Não foi possível iniciar stream de espectro: %s", exc)
+            self._spectrum_stream = None
+
+    def _stop_spectrum_stream(self) -> None:
+        stream = self._spectrum_stream
+        self._spectrum_stream = None
+        if stream is not None:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+
+    def _spectrum_reader_loop(self) -> None:
+        max_bytes = int(
+            self._spectrum_sample_rate
+            * (self._SPECTRUM_BUFFER_MS / 1000.0)
+            * 2
+            * self._spectrum_channels
+        )
+
+        while self._spectrum_running:
+            stream = self._spectrum_stream
+            if stream is None:
+                break
+            try:
+                data = stream.read(self._FRAMES_PER_BUFFER, exception_on_overflow=False)
+                with self._spectrum_buf_lock:
+                    combined = self._spectrum_buf + data
+                    self._spectrum_buf = combined[-max_bytes:]
+            except Exception:
+                break
+
+        _LOG.debug("SpectrumReader encerrado")
+
+    def capture_spectrum(self, duration_ms: int = 100, num_bars: int = 32) -> list[float]:
+        """Retorna espectro de frequências calculado a partir do buffer PCM acumulado."""
+        acquired = self._spectrum_lock.acquire(blocking=False)
+        if not acquired:
+            return self._last_spectrum.copy()
+
+        try:
+            with self._spectrum_buf_lock:
+                buf = self._spectrum_buf
+
+            if not buf or not _NUMPY_AVAILABLE:
+                return [0.0] * num_bars
+
+            samples = _np.frombuffer(buf, dtype="<i2").astype(_np.float32)
+            if samples.size < num_bars * 2:
+                return [0.0] * num_bars
+
+            fft_data = _np.abs(_np.fft.rfft(samples))
+            spectrum_size = max(1, int(len(fft_data) * 0.66))
+            fft_data = fft_data[:spectrum_size]
+
+            bars = []
+            for i in range(num_bars):
+                start_idx = int((i / num_bars) ** 1.3 * spectrum_size)
+                end_idx = max(start_idx + 1, int(((i + 1) / num_bars) ** 1.3 * spectrum_size))
+                band_avg = float(_np.mean(fft_data[start_idx:end_idx]))
+                if i > num_bars * 0.7:
+                    boost = 1.0 + (i - num_bars * 0.7) / (num_bars * 0.3) * 2.0
+                    band_avg *= boost
+                bars.append(band_avg)
+
+            max_raw = max(bars) if bars else 0.0
+            if max_raw < 1000:
+                self._last_spectrum = [0.0] * num_bars
+                return self._last_spectrum.copy()
+
+            result = [
+                min(1.0, b / max_raw * 1.5) if b > 0.10 else 0.0
+                for b in bars
+            ]
+            self._last_spectrum = result
+            return result
+
+        except Exception as exc:
+            _LOG.debug("Erro ao computar espectro: %s", exc)
+            return [0.0] * num_bars
+        finally:
+            self._spectrum_lock.release()

@@ -4,7 +4,7 @@
 
 list(APPEND FLUTTER_PLUGIN_LIST
   bitsdojo_window_linux
-  screen_retriever
+  screen_retriever_linux
   system_tray
   window_manager
 )

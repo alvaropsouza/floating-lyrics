@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Set
+from typing import Any, Awaitable, Callable, Set
 
 from aiohttp import web
 from aiohttp import WSMsgType
@@ -30,6 +30,7 @@ class WebSocketServer:
         self._app = web.Application()
         self._clients: Set[web.WebSocketResponse] = set()
         self._runner: web.AppRunner | None = None
+        self._command_handler: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]] | dict[str, Any] | None] | None = None
         
         # Registrar rotas
         self._app.router.add_get('/ws', self._websocket_handler)
@@ -93,6 +94,7 @@ class WebSocketServer:
         try:
             msg = json.loads(data)
             msg_type = msg.get("type")
+            payload = msg.get("data") if isinstance(msg.get("data"), dict) else {}
             
             _LOG.debug(f"Mensagem recebida: {msg_type}")
             
@@ -106,11 +108,52 @@ class WebSocketServer:
                     "type": "status",
                     "data": {"message": "Sistema pronto"}
                 })
+            elif msg_type in {"pause", "resume", "toggle_pause", "get_runtime_status", "debug_only"}:
+                result = await self._dispatch_command(msg_type, payload)
+                await self._send_to_client(ws, {
+                    "type": "command_result",
+                    "data": {
+                        "command": msg_type,
+                        **result,
+                    }
+                })
+                if "is_paused" in result:
+                    await self.broadcast({
+                        "type": "runtime_state",
+                        "data": {
+                            "is_paused": bool(result.get("is_paused", False)),
+                        }
+                    })
                 
         except json.JSONDecodeError:
             _LOG.warning(f"Mensagem inválida recebida: {data}")
         except Exception as exc:
             _LOG.error(f"Erro ao processar mensagem: {exc}", exc_info=True)
+
+    async def _dispatch_command(self, command: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Encaminha comandos recebidos para o handler registrado."""
+        if not self._command_handler:
+            return {
+                "ok": False,
+                "message": "Comandos não estão disponíveis no momento",
+            }
+
+        result = self._command_handler(command, payload)
+        if asyncio.iscoroutine(result):
+            resolved = await result
+        else:
+            resolved = result
+
+        if isinstance(resolved, dict):
+            return resolved
+        return {"ok": True}
+
+    def set_command_handler(
+        self,
+        handler: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]] | dict[str, Any] | None],
+    ) -> None:
+        """Registra callback para comandos vindos do cliente WebSocket."""
+        self._command_handler = handler
 
     async def _send_to_client(self, ws: web.WebSocketResponse, message: dict) -> None:
         """Envia mensagem para um cliente específico."""

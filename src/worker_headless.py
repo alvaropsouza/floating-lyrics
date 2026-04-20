@@ -39,6 +39,9 @@ class RecognitionWorkerHeadless(threading.Thread):
         self._recognizer = recognizer
         self._lyrics = lyrics_fetcher
         self._stop_flag = threading.Event()
+        self._pause_flag = threading.Event()
+        self._debug_only_flag = threading.Event()
+        self._pause_status_emitted = False
         self._current_song_key: tuple[str, str, str] | None = None
         self._miss_streak: int = 0
         self._lyrics_cache: dict[tuple[str, str, str], tuple[str, bool] | None] = {}
@@ -159,6 +162,7 @@ class RecognitionWorkerHeadless(threading.Thread):
         """Para a thread."""
         self._spectrum_running = False
         self._stop_flag.set()
+        self._pause_flag.clear()
         
         # Cancelar busca de letras pendente e aguardar shutdown
         if self._pending_lyrics_future and not self._pending_lyrics_future.done():
@@ -170,6 +174,45 @@ class RecognitionWorkerHeadless(threading.Thread):
         if self._spectrum_thread and self._spectrum_thread.is_alive():
             self._spectrum_thread.join(timeout=2)
         super().join(timeout)
+
+    def pause(self) -> None:
+        """Pausa ciclos de reconhecimento e captura de espectro."""
+        self._pause_flag.set()
+        self._debug_only_flag.clear()
+
+    def resume(self) -> None:
+        """Retoma ciclos de reconhecimento e captura de espectro."""
+        self._pause_flag.clear()
+        self._debug_only_flag.clear()
+        self._pause_status_emitted = False
+        self._emit('status_changed', "▶️ Retomando reconhecimento...")
+
+    def toggle_pause(self) -> bool:
+        """Alterna estado de pausa e retorna estado final (True=pausado)."""
+        if self._pause_flag.is_set():
+            self.resume()
+            return False
+        self.pause()
+        return True
+
+    def is_paused(self) -> bool:
+        """Retorna True quando o worker está pausado."""
+        return self._pause_flag.is_set()
+
+    def set_debug_only(self, enabled: bool) -> None:
+        """Modo debug: captura áudio e salva WAV mas não envia para APIs."""
+        if enabled:
+            self._pause_flag.clear()
+            self._debug_only_flag.set()
+            self._pause_status_emitted = False
+            self._emit('status_changed', "🔧 Modo debug: capturando áudio sem enviar para APIs")
+        else:
+            self._debug_only_flag.clear()
+            self._emit('status_changed', "▶️ Retomando reconhecimento normal...")
+
+    def is_debug_only(self) -> bool:
+        """Retorna True quando em modo debug (captura sem API)."""
+        return self._debug_only_flag.is_set()
 
     # ── Thread entry point ──────────────────────────────────────────────────
 
@@ -187,6 +230,14 @@ class RecognitionWorkerHeadless(threading.Thread):
         self._spectrum_thread.start()
         
         while not self._stop_flag.is_set():
+            if self._pause_flag.is_set():
+                if not self._pause_status_emitted:
+                    self._emit('status_changed', "⏸️ Reconhecimento pausado")
+                    self._pause_status_emitted = True
+                self._stop_flag.wait(timeout=0.2)
+                continue
+
+            self._pause_status_emitted = False
             try:
                 self._cycle()
             except Exception as exc:
@@ -209,6 +260,12 @@ class RecognitionWorkerHeadless(threading.Thread):
         first_call = True
         
         while self._spectrum_running and not self._stop_flag.is_set():
+            if self._pause_flag.is_set():
+                # Zera visualizador durante pausa para reforçar feedback na UI.
+                self._emit('audio_spectrum', [0.0] * 32)
+                self._stop_flag.wait(timeout=0.2)
+                continue
+
             try:
                 if first_call:
                     _LOG.info("Iniciando primeira captura de espectro...")
@@ -450,6 +507,13 @@ class RecognitionWorkerHeadless(threading.Thread):
         # Skip recognition if in tracking mode and not needed
         if self._should_skip_recognition():
             _LOG.debug("Skipping recognition (tracking mode)")
+            return
+
+        # Modo debug: salvar WAV e pular APIs
+        if self._debug_only_flag.is_set():
+            from src.song_recognition import _save_debug_audio
+            _save_debug_audio(audio_data, provider_name="debug_only")
+            self._emit('status_changed', "🔧 Áudio debug salvo em cache/debug_audio/")
             return
 
         # Recognize (pode demorar vários segundos - HTTP request bloqueante)

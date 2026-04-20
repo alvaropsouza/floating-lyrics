@@ -129,61 +129,87 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
     }
 
     return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 48, color: Colors.white24),
-          const SizedBox(height: 12),
-          Flexible(
-            child: Text(
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 20),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+        decoration: BoxDecoration(
+          color: Colors.white.withOpacity(0.04),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: Colors.white.withOpacity(0.12)),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 42, color: Colors.white38),
+            const SizedBox(height: 10),
+            Text(
               message,
               style: const TextStyle(
-                color: Colors.white54,
+                color: Colors.white70,
                 fontSize: 14,
+                fontWeight: FontWeight.w500,
               ),
               textAlign: TextAlign.center,
               overflow: TextOverflow.ellipsis,
-              maxLines: 2,
+              maxLines: 3,
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
 
   Widget _buildLyricsList(LyricsData lyrics) {
-    return ListView.builder(
-      controller: _scrollController,
-      padding: const EdgeInsets.symmetric(vertical: 40, horizontal: 20),
-      itemCount: lyrics.lines.length,
-      itemBuilder: (context, index) {
-        final line = lyrics.lines[index];
-        final isActive = lyrics.synced && index == _currentLineIndex;
-        final isPast = lyrics.synced && index < _currentLineIndex;
+    return Container(
+      margin: const EdgeInsets.fromLTRB(10, 8, 10, 10),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(20),
+        color: Colors.white.withOpacity(0.03),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
+      ),
+      child: ListView.builder(
+        controller: _scrollController,
+        padding: const EdgeInsets.symmetric(vertical: 30, horizontal: 18),
+        itemCount: lyrics.lines.length,
+        itemBuilder: (context, index) {
+          final line = lyrics.lines[index];
+          final isActive = lyrics.synced && index == _currentLineIndex;
+          final isPast = lyrics.synced && index < _currentLineIndex;
 
-        return AnimatedContainer(
-          duration: const Duration(milliseconds: 200),
-          margin: const EdgeInsets.symmetric(vertical: 8),
-          child: AnimatedDefaultTextStyle(
-            duration: const Duration(milliseconds: 200),
-            style: TextStyle(
-              fontSize: isActive ? 20 : 16,
-              fontWeight: isActive ? FontWeight.bold : FontWeight.normal,
+          return AnimatedContainer(
+            duration: const Duration(milliseconds: 220),
+            margin: const EdgeInsets.symmetric(vertical: 8),
+            padding: EdgeInsets.symmetric(
+              vertical: isActive ? 10 : 6,
+              horizontal: 10,
+            ),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(12),
               color: isActive
-                  ? Colors.white
-                  : isPast
-                      ? Colors.white38
-                      : Colors.white70,
-              height: 1.5,
+                  ? Colors.white.withOpacity(0.09)
+                  : Colors.transparent,
             ),
-            child: Text(
-              line.text,
-              textAlign: TextAlign.center,
+            child: AnimatedDefaultTextStyle(
+              duration: const Duration(milliseconds: 220),
+              style: TextStyle(
+                fontSize: isActive ? 21 : 16,
+                fontWeight: isActive ? FontWeight.w700 : FontWeight.w500,
+                color: isActive
+                    ? Colors.white
+                    : isPast
+                        ? Colors.white38
+                        : Colors.white70,
+                height: 1.45,
+              ),
+              child: Text(
+                line.text,
+                textAlign: TextAlign.center,
+              ),
             ),
-          ),
-        );
-      },
+          );
+        },
+      ),
     );
   }
 }
