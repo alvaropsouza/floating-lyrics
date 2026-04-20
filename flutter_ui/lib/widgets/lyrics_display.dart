@@ -17,12 +17,16 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
   Timer? _syncTimer;
   int _currentLineIndex = 0;
 
+  // Uma GlobalKey por linha — permite Scrollable.ensureVisible encontrar a
+  // linha exata no render tree sem depender de altura hardcoded.
+  List<GlobalKey> _lineKeys = [];
+
   @override
   void initState() {
     super.initState();
 
-    // Timer para sincronização (atualiza a cada 100ms)
-    _syncTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
+    // 50ms = 20 Hz: responsivo o suficiente sem desperdiçar frame budget.
+    _syncTimer = Timer.periodic(const Duration(milliseconds: 50), (_) {
       _updateCurrentLine();
     });
   }
@@ -38,23 +42,28 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
     final ws = context.read<WebSocketService>();
     final lyrics = ws.lyrics;
 
-    if (lyrics == null || !lyrics.synced) return;
-
-    if (lyrics.lines.isEmpty) {
-      debugPrint('ALERTA _updateCurrentLine: lyrics.lines está vazio!');
+    if (lyrics == null || !lyrics.synced) {
+      if (_lineKeys.isNotEmpty || _currentLineIndex != 0) {
+        setState(() {
+          _lineKeys = [];
+          _currentLineIndex = 0;
+        });
+      }
       return;
     }
 
-    // Usar posição calculada em tempo real ao invés de timecodeMs estático
-    final currentPositionMs = ws.currentPositionMs;
-
-    // Debug ocasional
-    if (_currentLineIndex == 0 && currentPositionMs > 1000) {
-      debugPrint(
-          '📍 Posição atual: ${currentPositionMs}ms (${(currentPositionMs / 1000).toStringAsFixed(1)}s)');
+    // Reconstruir chaves quando as letras mudarem (nova música).
+    if (_lineKeys.length != lyrics.lines.length) {
+      setState(() {
+        _lineKeys = List.generate(lyrics.lines.length, (_) => GlobalKey());
+        _currentLineIndex = 0;
+      });
+      return;
     }
 
-    // Encontrar linha atual baseada na posição calculada
+    final currentPositionMs = ws.currentPositionMs;
+
+    // Encontrar última linha cujo timestamp já passou.
     int newIndex = 0;
     for (int i = 0; i < lyrics.lines.length; i++) {
       final lineTime = lyrics.lines[i].timeMs;
@@ -73,18 +82,16 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
     }
   }
 
+  /// Rola para centralizar a linha ativa usando a posição real do widget,
+  /// não uma estimativa de altura hardcoded.
   void _scrollToCurrentLine() {
-    if (!_scrollController.hasClients) return;
-
-    // Scroll suave para a linha atual (centralizada)
-    const itemHeight = 60.0; // Altura aproximada de cada linha
-    final targetOffset = (_currentLineIndex * itemHeight) -
-        (_scrollController.position.viewportDimension / 2) +
-        (itemHeight / 2);
-
-    _scrollController.animateTo(
-      targetOffset.clamp(0.0, _scrollController.position.maxScrollExtent),
-      duration: const Duration(milliseconds: 300),
+    if (_currentLineIndex >= _lineKeys.length) return;
+    final ctx = _lineKeys[_currentLineIndex].currentContext;
+    if (ctx == null) return;
+    Scrollable.ensureVisible(
+      ctx,
+      alignment: 0.5, // centraliza no viewport
+      duration: const Duration(milliseconds: 200),
       curve: Curves.easeOut,
     );
   }
@@ -106,6 +113,11 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
               style: TextStyle(color: Colors.red),
             ),
           );
+        }
+
+        // Garantir chaves sincronizadas caso o build rode antes do timer.
+        if (_lineKeys.length != lyrics.lines.length) {
+          _lineKeys = List.generate(lyrics.lines.length, (_) => GlobalKey());
         }
 
         return _buildLyricsList(lyrics);
@@ -161,6 +173,9 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
   }
 
   Widget _buildLyricsList(LyricsData lyrics) {
+    // SingleChildScrollView + Column garante que todos os itens estão na
+    // render tree, permitindo Scrollable.ensureVisible funcionar em qualquer
+    // linha — inclusive as que ainda não foram visíveis.
     return Container(
       margin: const EdgeInsets.fromLTRB(10, 8, 10, 10),
       decoration: BoxDecoration(
@@ -168,47 +183,55 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
         color: Colors.white.withOpacity(0.03),
         border: Border.all(color: Colors.white.withOpacity(0.08)),
       ),
-      child: ListView.builder(
+      child: SingleChildScrollView(
         controller: _scrollController,
         padding: const EdgeInsets.symmetric(vertical: 30, horizontal: 18),
-        itemCount: lyrics.lines.length,
-        itemBuilder: (context, index) {
-          final line = lyrics.lines[index];
-          final isActive = lyrics.synced && index == _currentLineIndex;
-          final isPast = lyrics.synced && index < _currentLineIndex;
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (int index = 0; index < lyrics.lines.length; index++)
+              _buildLyricLine(lyrics, index),
+          ],
+        ),
+      ),
+    );
+  }
 
-          return AnimatedContainer(
-            duration: const Duration(milliseconds: 220),
-            margin: const EdgeInsets.symmetric(vertical: 8),
-            padding: EdgeInsets.symmetric(
-              vertical: isActive ? 10 : 6,
-              horizontal: 10,
-            ),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(12),
-              color: isActive
-                  ? Colors.white.withOpacity(0.09)
-                  : Colors.transparent,
-            ),
-            child: AnimatedDefaultTextStyle(
-              duration: const Duration(milliseconds: 220),
-              style: TextStyle(
-                fontSize: isActive ? 21 : 16,
-                fontWeight: isActive ? FontWeight.w700 : FontWeight.w500,
-                color: isActive
-                    ? Colors.white
-                    : isPast
-                        ? Colors.white38
-                        : Colors.white70,
-                height: 1.45,
-              ),
-              child: Text(
-                line.text,
-                textAlign: TextAlign.center,
-              ),
-            ),
-          );
-        },
+  Widget _buildLyricLine(LyricsData lyrics, int index) {
+    final line = lyrics.lines[index];
+    final isActive = lyrics.synced && index == _currentLineIndex;
+    final isPast = lyrics.synced && index < _currentLineIndex;
+    // Chave para Scrollable.ensureVisible — segura mesmo se ainda não inicializada.
+    final key = index < _lineKeys.length ? _lineKeys[index] : null;
+
+    return AnimatedContainer(
+      key: key,
+      duration: const Duration(milliseconds: 80),
+      margin: const EdgeInsets.symmetric(vertical: 8),
+      padding: EdgeInsets.symmetric(
+        vertical: isActive ? 10 : 6,
+        horizontal: 10,
+      ),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(12),
+        color: isActive ? Colors.white.withOpacity(0.09) : Colors.transparent,
+      ),
+      child: AnimatedDefaultTextStyle(
+        duration: const Duration(milliseconds: 80),
+        style: TextStyle(
+          fontSize: isActive ? 21 : 16,
+          fontWeight: isActive ? FontWeight.w700 : FontWeight.w500,
+          color: isActive
+              ? Colors.white
+              : isPast
+                  ? Colors.white38
+                  : Colors.white70,
+          height: 1.45,
+        ),
+        child: Text(
+          line.text,
+          textAlign: TextAlign.center,
+        ),
       ),
     );
   }

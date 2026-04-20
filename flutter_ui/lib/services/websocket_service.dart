@@ -155,14 +155,7 @@ class WebSocketService extends ChangeNotifier {
 
         case 'timecode_updated':
           _timecodeMs = payload?['timecode_ms'] as int? ?? 0;
-          // Armazenar timestamp LOCAL quando recebemos este evento
           _localTimestamp = DateTime.now().millisecondsSinceEpoch;
-
-          // Debug: Log apenas na primeira vez para verificar sincronização
-          if (_timecodeMs > 0) {
-            debugPrint(
-                '🎵 Timecode: ${_timecodeMs}ms (${(_timecodeMs / 1000).toStringAsFixed(1)}s)');
-          }
           break;
 
         case 'error':

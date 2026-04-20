@@ -10,6 +10,7 @@ Funciona exclusivamente no Windows via WASAPI loopback.
 import io
 import logging
 import threading
+import time
 import wave
 from typing import Optional
 
@@ -322,72 +323,127 @@ class AudioCapture:
                 pass
 
     def _spectrum_reader_loop(self) -> None:
-        max_bytes = int(
-            self._spectrum_sample_rate
-            * (self._SPECTRUM_BUFFER_MS / 1000.0)
-            * 2
-            * self._spectrum_channels
+        """
+        Thread dedicada ao espectro. Nunca para enquanto self._spectrum_running=True.
+        Erros de leitura resultam em espera + retry — a thread não sai por conta própria.
+
+        Pipeline:
+          int16 PCM estéreo
+            → downmix mono
+            → ring buffer 2048 amostras
+            → FFT com janela de Hann
+            → 32 bandas em escala mel (percepção logarítmica)
+            → normalização dinâmica com pico decrescente
+            → suavização exponencial (ataque rápido / liberação lenta)
+            → self._last_spectrum
+        """
+        if not _NUMPY_AVAILABLE:
+            _LOG.warning("NumPy não disponível — espectro de áudio desabilitado.")
+            return
+
+        sr = self._spectrum_sample_rate
+        ch = self._spectrum_channels
+        num_bars = 32
+        fpb = self._FRAMES_PER_BUFFER  # 1024 amostras por leitura
+
+        # Janela de FFT: 2048 amostras (~46 ms @ 44100 Hz)
+        FFT_N = 2048
+        hann = _np.hanning(FFT_N).astype(_np.float32)
+
+        # Escala mel perceptual — nossos ouvidos percebem frequências em escala log
+        nyquist = sr / 2.0
+        mel_lo = 2595.0 * _np.log10(1.0 + 40.0 / 700.0)          # ~40 Hz (sub-bass)
+        mel_hi = 2595.0 * _np.log10(1.0 + min(nyquist * 0.95, 16000.0) / 700.0)
+        mel_edges = _np.linspace(mel_lo, mel_hi, num_bars + 1)
+        hz_edges = 700.0 * (10.0 ** (mel_edges / 2595.0) - 1.0)
+        fft_freqs = _np.fft.rfftfreq(FFT_N, d=1.0 / sr)
+
+        # Índices de banda pré-calculados para evitar busca por frame
+        band_lo = [int(_np.searchsorted(fft_freqs, hz_edges[i])) for i in range(num_bars)]
+        band_hi = [
+            max(band_lo[i] + 1, int(_np.searchsorted(fft_freqs, hz_edges[i + 1])))
+            for i in range(num_bars)
+        ]
+
+        # Ring buffer mono float32
+        ring = _np.zeros(FFT_N, dtype=_np.float32)
+        n_filled = 0
+
+        # Normalização dinâmica POR BANDA: cada banda rastreia seu próprio pico.
+        # Isso evita que os graves (muito mais energéticos) "abafem" os médios e agudos.
+        # Mínimo de 1e-4 evita amplificar o ruído de fundo em bandas sempre silenciosas.
+        band_peaks = _np.full(num_bars, 1e-4, dtype=_np.float32)
+        # PEAK_DECAY: cada frame a referência decai ~0.3%; ½ vida ≈ 230 frames ≈ 5 s
+        PEAK_DECAY = 0.997
+        # Sem EMA aqui — suavização visual fica inteiramente no Flutter (60 FPS).
+        # Dupla suavização (Python + Flutter) causava efeito "slow motion".
+
+        _LOG.info(
+            "SpectrumReader: FFT=%d pts, %d bandas mel [%.0f–%.0f Hz], %d Hz %d ch",
+            FFT_N, num_bars, hz_edges[0], hz_edges[-1], sr, ch,
         )
 
         while self._spectrum_running:
             stream = self._spectrum_stream
             if stream is None:
-                break
+                time.sleep(0.1)
+                continue
+
             try:
-                data = stream.read(self._FRAMES_PER_BUFFER, exception_on_overflow=False)
-                with self._spectrum_buf_lock:
-                    combined = self._spectrum_buf + data
-                    self._spectrum_buf = combined[-max_bytes:]
-            except Exception:
-                break
+                data = stream.read(fpb, exception_on_overflow=False)
+            except Exception as exc:
+                _LOG.debug("SpectrumReader: leitura falhou (%s) — aguardando 0.5 s", exc)
+                time.sleep(0.5)
+                continue
+
+            # Decodificar int16 normalizado, downmix estéreo → mono
+            raw = _np.frombuffer(data, dtype="<i2").astype(_np.float32) / 32768.0
+            if ch >= 2 and len(raw) >= ch:
+                n_frames = len(raw) // ch
+                raw = raw[: n_frames * ch].reshape(n_frames, ch).mean(axis=1)
+
+            # Preencher ring buffer com scroll
+            n = len(raw)
+            if n >= FFT_N:
+                ring[:] = raw[-FFT_N:]
+                n_filled = FFT_N
+            else:
+                ring[:-n] = ring[n:]
+                ring[-n:] = raw
+                n_filled = min(n_filled + n, FFT_N)
+
+            # Aguardar pelo menos metade do buffer para a primeira FFT
+            if n_filled < FFT_N // 2:
+                continue
+
+            # FFT com janela de Hann — reduz vazamento espectral nas bordas
+            fft_mag = _np.abs(_np.fft.rfft(ring * hann))
+
+            # Média de magnitude por banda mel
+            bars = _np.array(
+                [float(fft_mag[lo:hi].mean()) for lo, hi in zip(band_lo, band_hi)],
+                dtype=_np.float32,
+            )
+
+            # Normalização dinâmica por banda: cada banda tem seu próprio pico decrescente
+            mask_up = bars > band_peaks
+            band_peaks = _np.where(mask_up, bars, _np.maximum(band_peaks * PEAK_DECAY, 1e-4))
+            normalized = _np.clip(bars / band_peaks, 0.0, 1.0)
+
+            with self._spectrum_buf_lock:
+                self._last_spectrum = normalized.tolist()
 
         _LOG.debug("SpectrumReader encerrado")
 
-    def capture_spectrum(self, duration_ms: int = 100, num_bars: int = 32) -> list[float]:
-        """Retorna espectro de frequências calculado a partir do buffer PCM acumulado."""
-        acquired = self._spectrum_lock.acquire(blocking=False)
-        if not acquired:
-            return self._last_spectrum.copy()
-
-        try:
-            with self._spectrum_buf_lock:
-                buf = self._spectrum_buf
-
-            if not buf or not _NUMPY_AVAILABLE:
-                return [0.0] * num_bars
-
-            samples = _np.frombuffer(buf, dtype="<i2").astype(_np.float32)
-            if samples.size < num_bars * 2:
-                return [0.0] * num_bars
-
-            fft_data = _np.abs(_np.fft.rfft(samples))
-            spectrum_size = max(1, int(len(fft_data) * 0.66))
-            fft_data = fft_data[:spectrum_size]
-
-            bars = []
-            for i in range(num_bars):
-                start_idx = int((i / num_bars) ** 1.3 * spectrum_size)
-                end_idx = max(start_idx + 1, int(((i + 1) / num_bars) ** 1.3 * spectrum_size))
-                band_avg = float(_np.mean(fft_data[start_idx:end_idx]))
-                if i > num_bars * 0.7:
-                    boost = 1.0 + (i - num_bars * 0.7) / (num_bars * 0.3) * 2.0
-                    band_avg *= boost
-                bars.append(band_avg)
-
-            max_raw = max(bars) if bars else 0.0
-            if max_raw < 1000:
-                self._last_spectrum = [0.0] * num_bars
-                return self._last_spectrum.copy()
-
-            result = [
-                min(1.0, b / max_raw * 1.5) if b > 0.10 else 0.0
-                for b in bars
-            ]
-            self._last_spectrum = result
+    def capture_spectrum(self, num_bars: int = 32) -> list[float]:
+        """Retorna o último espectro computado pelo SpectrumReader (thread-safe)."""
+        with self._spectrum_buf_lock:
+            result = list(self._last_spectrum)
+        n = len(result)
+        if n == num_bars:
             return result
-
-        except Exception as exc:
-            _LOG.debug("Erro ao computar espectro: %s", exc)
+        if n == 0:
             return [0.0] * num_bars
-        finally:
-            self._spectrum_lock.release()
+        # Redimensionar se num_bars diferir (fallback de compatibilidade)
+        step = n / num_bars
+        return [result[int(i * step)] for i in range(num_bars)]

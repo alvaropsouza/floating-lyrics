@@ -7,11 +7,15 @@ cd "$ROOT_DIR"
 
 BACKEND_PID=""
 START_FRONTEND=true
+BACKEND_RELOAD=true
 
 for arg in "$@"; do
     case "$arg" in
         --no-front|--no-frontend)
             START_FRONTEND=false
+            ;;
+        --no-reload)
+            BACKEND_RELOAD=false
             ;;
         *)
             ;;
@@ -49,8 +53,13 @@ if ! python -c "import aiohttp" >/dev/null 2>&1; then
     pip install -r requirements_headless.txt
 fi
 
-echo "[*] Iniciando backend Python headless em background..."
-python main_server_headless.py &
+if [ "$BACKEND_RELOAD" = true ]; then
+    echo "[*] Iniciando backend Python headless com auto-reload em background..."
+    python main_server_headless.py --reload &
+else
+    echo "[*] Iniciando backend Python headless em background..."
+    python main_server_headless.py &
+fi
 BACKEND_PID=$!
 
 echo "[*] Aguardando backend responder..."

@@ -163,8 +163,8 @@ class _ControlPanel extends StatelessWidget {
             Expanded(
               child: FilledButton.icon(
                 onPressed: canControl ? ws.togglePause : null,
-                icon:
-                    Icon(paused ? Icons.play_arrow_rounded : Icons.pause_rounded),
+                icon: Icon(
+                    paused ? Icons.play_arrow_rounded : Icons.pause_rounded),
                 label: Text(paused ? 'Retomar' : 'Pausar'),
                 style: FilledButton.styleFrom(
                   backgroundColor: paused ? Colors.teal : colors.primary,
@@ -308,8 +308,8 @@ class _TrackBanner extends StatelessWidget {
                         alignment: Alignment.center,
                         decoration: BoxDecoration(
                           borderRadius: BorderRadius.circular(4),
-                          border:
-                              Border.all(color: const Color(0xFF2CD6FF), width: 1),
+                          border: Border.all(
+                              color: const Color(0xFF2CD6FF), width: 1),
                           color: const Color(0xFF0A151D),
                         ),
                         child: const Text(
@@ -436,14 +436,19 @@ class _MarqueeTextState extends State<_MarqueeText>
             animation: _controller,
             builder: (context, _) {
               final x = -_controller.value * distance;
-              return Transform.translate(
-                offset: Offset(x, 0),
-                child: Row(
-                  children: [
-                    Text(widget.text, style: widget.style),
-                    const SizedBox(width: _gap),
-                    Text(widget.text, style: widget.style),
-                  ],
+              return OverflowBox(
+                alignment: Alignment.centerLeft,
+                maxWidth: double.infinity,
+                child: Transform.translate(
+                  offset: Offset(x, 0),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(widget.text, style: widget.style),
+                      const SizedBox(width: _gap),
+                      Text(widget.text, style: widget.style),
+                    ],
+                  ),
                 ),
               );
             },
@@ -468,8 +473,9 @@ class _OffsetControls extends StatelessWidget {
 
         final offset = ws.lrcOffsetMs;
         final sign = offset > 0 ? '+' : '';
-        final offsetText =
-            offset == 0 ? '+/-0s' : '$sign${(offset / 1000).toStringAsFixed(1)}s';
+        final offsetText = offset == 0
+            ? '+/-0s'
+            : '$sign${(offset / 1000).toStringAsFixed(1)}s';
 
         return Padding(
           padding: const EdgeInsets.fromLTRB(12, 2, 12, 4),
@@ -481,6 +487,11 @@ class _OffsetControls extends StatelessWidget {
                 style: TextStyle(color: Colors.white38, fontSize: 10),
               ),
               const SizedBox(width: 4),
+              _OffsetButton(
+                icon: Icons.keyboard_double_arrow_left_rounded,
+                tooltip: '-1000ms',
+                onPressed: () => ws.adjustLrcOffset(-1000),
+              ),
               _OffsetButton(
                 icon: Icons.fast_rewind_rounded,
                 tooltip: '-500ms',
@@ -532,6 +543,11 @@ class _OffsetControls extends StatelessWidget {
                 icon: Icons.fast_forward_rounded,
                 tooltip: '+500ms',
                 onPressed: () => ws.adjustLrcOffset(500),
+              ),
+              _OffsetButton(
+                icon: Icons.keyboard_double_arrow_right_rounded,
+                tooltip: '+1000ms',
+                onPressed: () => ws.adjustLrcOffset(1000),
               ),
             ],
           ),

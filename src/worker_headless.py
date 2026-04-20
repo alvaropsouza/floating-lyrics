@@ -131,6 +131,16 @@ class RecognitionWorkerHeadless(threading.Thread):
             self._config.getint("Recognition", "silence_trigger_frames", fallback=20),
         )  # 20 frames * 50ms = 1s de silêncio para armar o gatilho
         self._silence_triggered = False  # True = estava em silêncio, esperando nova música
+        self._post_silence_audio_frames = 0
+        self._silence_recovery_frames = max(
+            1,
+            self._config.getint("Recognition", "silence_recovery_frames", fallback=8),
+        )
+        self._silence_recovery_energy_multiplier = self._config.getfloat(
+            "Recognition",
+            "silence_recovery_energy_multiplier",
+            fallback=1.8,
+        )
 
 
         
@@ -161,11 +171,10 @@ class RecognitionWorkerHeadless(threading.Thread):
         self._current_lyrics_index: int = 0
         self._stt_last_segment = None
         
-        # Ler configurações STT de config.ini
+        # Ler configurações STT de config.ini (init do modelo é lazy — roda na thread do worker)
         if _STT_AVAILABLE:
             self._stt_enabled = self._config.getboolean("SpeechSync", "enabled", fallback=False)
             self._stt_mode = self._config.get("SpeechSync", "mode", fallback="timestamp_only")
-            self._init_stt()
         
         # Callbacks para STT (adicionados aos callbacks existentes)
         self._callbacks.setdefault('stt_recognized', [])
@@ -274,6 +283,17 @@ class RecognitionWorkerHeadless(threading.Thread):
             name="SpectrumCapture"
         )
         self._spectrum_thread.start()
+
+        # Iniciar thread STT em background — o modelo Whisper é carregado dentro da thread
+        # (nunca no event loop asyncio) e a thread fica em idle até as letras chegarem
+        if _STT_AVAILABLE and self._stt_enabled:
+            self._stt_thread = threading.Thread(
+                target=self._stt_init_and_loop,
+                daemon=True,
+                name="STTSync",
+            )
+            self._stt_thread.start()
+            _LOG.info("🎤 STT thread iniciada (aguardando carregamento do modelo...)")
         
         while not self._stop_flag.is_set():
             if self._pause_flag.is_set():
@@ -299,12 +319,9 @@ class RecognitionWorkerHeadless(threading.Thread):
         _LOG.info("Worker headless parado")
 
     def _spectrum_loop(self) -> None:
-        """Loop contínuo de captura de espectro de áudio."""
-        _LOG.info("🎵 Thread de captura de espectro iniciada")
-        error_count = 0
-        max_errors = 10
-        first_call = True
-        
+        """Loop contínuo de emissão de espectro. Nunca para por erros — apenas pelo stop_flag."""
+        _LOG.info("🎵 Thread de espectro iniciada (~30 FPS)")
+
         while self._spectrum_running and not self._stop_flag.is_set():
             if self._pause_flag.is_set():
                 # Zera visualizador durante pausa para reforçar feedback na UI.
@@ -313,33 +330,17 @@ class RecognitionWorkerHeadless(threading.Thread):
                 continue
 
             try:
-                if first_call:
-                    _LOG.info("Iniciando primeira captura de espectro...")
-                    first_call = False
-                    
-                # Capturar espectro (100ms de áudio)
-                spectrum = self._audio.capture_spectrum(duration_ms=100, num_bars=32)
+                # capture_spectrum() apenas lê _last_spectrum pré-computado pelo SpectrumReader
+                spectrum = self._audio.capture_spectrum(num_bars=32)
                 self._emit('audio_spectrum', spectrum)
-                error_count = 0  # Reset contador de erros em caso de sucesso
-                
-                # Detectar silêncio prolongado
+                # Detector de silêncio/mudança de música baseado no espectro
                 self._update_local_change_detector(spectrum)
-                    
             except Exception as exc:
-                error_count += 1
-                if error_count <= 3:  # Logar apenas primeiros 3 erros
-                    _LOG.warning(f"Erro ao capturar espectro ({error_count}/{max_errors}): {exc}")
-                elif error_count == max_errors:
-                    _LOG.error("Muitos erros consecutivos ao capturar espectro. Parando thread.")
-                    break
-            
-            # Verificar stop flag antes de dormir
-            if self._stop_flag.is_set():
-                break
-            
-            # Atualizar ~20 vezes por segundo (50ms de sleep)
-            time.sleep(0.05)
-        
+                _LOG.debug("Erro no loop de espectro (continuando): %s", exc)
+
+            # ~30 FPS; usa wait() para responder ao stop_flag imediatamente
+            self._stop_flag.wait(timeout=0.033)
+
         _LOG.info("Thread de espectro parada")
 
     def _check_silence_and_reset(self, spectrum: list[float]) -> None:
@@ -395,13 +396,34 @@ class RecognitionWorkerHeadless(threading.Thread):
         self._change_baseline = None
         self._change_window = []
         self._silence_triggered = False
+        self._post_silence_audio_frames = 0
+        # Limpar letras STT para não sincronizar contra música anterior
+        with self._stt_lock:
+            self._current_lyrics_for_stt = None
+            self._current_lyrics_index = 0
         self._emit('song_not_found')
+
+    def _emit_compensated_timecode(self, timecode_ms: int, capture_start: float, context: str) -> None:
+        """Emite timecode compensado para latência de captura/rede/processamento."""
+        if timecode_ms <= 0:
+            return
+        elapsed_ms = int((time.perf_counter() - capture_start) * 1000)
+        compensated_timecode = timecode_ms + elapsed_ms
+        _LOG.debug(
+            "%s: %dms + %dms = %dms",
+            context,
+            timecode_ms,
+            elapsed_ms,
+            compensated_timecode,
+        )
+        self._emit('timecode_updated', compensated_timecode, capture_start)
 
     def _update_local_change_detector(self, spectrum: list[float]) -> None:
         if self._current_song_key is None:
             # Sem música ativa: manter apenas detecção de silêncio para não disparar desnecessariamente
             self._change_baseline = None
             self._change_window = []
+            self._post_silence_audio_frames = 0
             avg_energy = sum(spectrum) / len(spectrum) if spectrum else 0.0
             if avg_energy < self._change_min_energy:
                 self._silence_frames += 1
@@ -419,18 +441,34 @@ class RecognitionWorkerHeadless(threading.Thread):
         # ── Detecção silêncio → áudio ───────────────────────────────────────
         if is_silent:
             self._silence_frames += 1
+            self._post_silence_audio_frames = 0
             if self._silence_frames >= self._silence_trigger_frames:
                 self._silence_triggered = True  # armar o gatilho
         else:
-            if self._silence_triggered and not in_cooldown:
-                # Havia silêncio prolongado e agora voltou o áudio = troca de faixa
-                self._reset_song_state(
-                    f"silencio de {self._silence_frames * 50}ms seguido de audio"
-                )
-                self._silence_frames = 0
-                return
+            if self._silence_triggered:
+                # Evita falso positivo: exige volta consistente de energia para confirmar troca.
+                recovery_energy = self._change_min_energy * max(1.0, self._silence_recovery_energy_multiplier)
+                if avg_energy >= recovery_energy:
+                    self._post_silence_audio_frames += 1
+                else:
+                    self._post_silence_audio_frames = 0
+
+                if self._post_silence_audio_frames >= self._silence_recovery_frames:
+                    if not in_cooldown:
+                        self._reset_song_state(
+                            (
+                                f"silencio de {self._silence_frames * 50}ms seguido de "
+                                f"audio consistente ({self._post_silence_audio_frames} frames)"
+                            )
+                        )
+                        self._silence_frames = 0
+                        return
+                    self._silence_triggered = False
+                    self._post_silence_audio_frames = 0
             self._silence_frames = 0
-            self._silence_triggered = False
+
+            if not self._silence_triggered:
+                self._post_silence_audio_frames = 0
 
         if is_silent or in_cooldown:
             return
@@ -560,8 +598,10 @@ class RecognitionWorkerHeadless(threading.Thread):
                 _LOG.warning(f"Rate-limited. Retrying in {remaining // 60} minutes")
             return
 
-        # Emit status
-        self._emit('status_changed', "🎵 Capturando áudio...")
+        # Emitir status apenas quando procurando nova música — em tracking
+        # a re-sincronização ocorre silenciosamente para não poluir a UI.
+        if self._current_song_key is None:
+            self._emit('status_changed', "🎵 Capturando áudio...")
 
         # Capture audio (pode demorar vários segundos - operação bloqueante)
         try:
@@ -571,7 +611,7 @@ class RecognitionWorkerHeadless(threading.Thread):
             audio_data = self._audio.capture(duration)
             _LOG.debug(f"Worker: captura concluída ({len(audio_data) if audio_data else 0} bytes)")
             if audio_data is None or len(audio_data) == 0:
-                _LOG.debug("No audio captured")
+                _LOG.warning("Nenhum áudio capturado após %ds — dispositivo de captura retornou vazio.", duration)
                 return
         except Exception as exc:
             # Se foi interrompido por shutdown, não logar como erro
@@ -589,7 +629,8 @@ class RecognitionWorkerHeadless(threading.Thread):
 
         # Skip recognition if in tracking mode and not needed
         if self._should_skip_recognition():
-            _LOG.debug("Skipping recognition (tracking mode)")
+            song_title = self._current_song_key[0] if self._current_song_key else "?"
+            _LOG.debug("Rastreando '%s' — intervalo não atingido, pulando chamada de API.", song_title)
             return
 
         # Modo debug: salvar WAV e pular APIs
@@ -706,17 +747,11 @@ class RecognitionWorkerHeadless(threading.Thread):
         if song_key == self._current_song_key:
             # Same song, just update timecode
             if result.timecode_ms is not None and result.timecode_ms > 0:
-                # 🔧 COMPENSAÇÃO AUTOMÁTICA DE LATÊNCIA:
-                # Adiciona o tempo decorrido desde a captura para compensar
-                # o delay de: tempo de captura + processamento API + network
-                elapsed_ms = int((time.perf_counter() - capture_start) * 1000)
-                compensated_timecode = result.timecode_ms + elapsed_ms
-                
-                _LOG.debug(
-                    f"🎵 Timecode compensado: {result.timecode_ms}ms + {elapsed_ms}ms delay = {compensated_timecode}ms"
+                self._emit_compensated_timecode(
+                    result.timecode_ms,
+                    capture_start,
+                    "🎵 Timecode compensado",
                 )
-                
-                self._emit('timecode_updated', compensated_timecode, capture_start)
             self._miss_streak = 0
             self._new_song_attempts = 0
             self._new_song_cooldown_until = 0.0
@@ -750,15 +785,11 @@ class RecognitionWorkerHeadless(threading.Thread):
             
             # Update timecode anyway
             if result.timecode_ms is not None and result.timecode_ms > 0:
-                # 🔧 COMPENSAÇÃO AUTOMÁTICA DE LATÊNCIA
-                elapsed_ms = int((time.perf_counter() - capture_start) * 1000)
-                compensated_timecode = result.timecode_ms + elapsed_ms
-                
-                _LOG.debug(
-                    f"🎵 Timecode inicial compensado: {result.timecode_ms}ms + {elapsed_ms}ms = {compensated_timecode}ms"
+                self._emit_compensated_timecode(
+                    result.timecode_ms,
+                    capture_start,
+                    "🎵 Timecode inicial compensado",
                 )
-                
-                self._emit('timecode_updated', compensated_timecode, capture_start)
             return
         
         # Cancelar busca anterior se ainda estiver rodando
@@ -784,18 +815,24 @@ class RecognitionWorkerHeadless(threading.Thread):
         )
 
     def _fetch_lyrics_async(self, song_key, result, capture_start: float) -> tuple:
-        """Busca letras (roda em thread separada).
-
-        Se /search estiver disponível, usa para corrigir metadados (artista/título/álbum)
-        antes de buscar letras no lrclib com dados mais precisos.
-        """
+        """Busca letras (roda em thread separada) usando os metadados diretos
+        retornados pela API de reconhecimento de música."""
         try:
             title = result.title
             artist = result.artist
-            album = result.album
 
-            # ── Buscar letras via lrclib com dados originais do reconhecimento
-            _LOG.info("🔍 Buscando letras via lrclib: title='%s' artist='%s'", title, artist)
+            # Não usar o álbum se ele for idêntico ao título: é um artefato
+            # de algumas APIs (ex: ACRCloud) que preenchem o campo album com o
+            # nome da faixa quando não conhecem o álbum real.
+            album = result.album
+            if album.lower() == title.lower():
+                _LOG.debug(
+                    "Album='%s' é igual ao título — omitindo da busca de letras.",
+                    album,
+                )
+                album = ""
+
+            _LOG.info("🔍 Buscando letras via lrclib: title='%s' artist='%s' album='%s'", title, artist, album or '(omitido)')
             lyrics_result = self._lyrics.fetch(
                 title=title,
                 artist=artist,
@@ -831,15 +868,22 @@ class RecognitionWorkerHeadless(threading.Thread):
                     lyrics_text = "\n".join(lyrics_result.lines)
                 
                 self._lyrics_cache[song_key] = (lyrics_text, lyrics_result.synced)
+
+                # Emitir timecode ANTES das letras: Flutter recebe a posição
+                # correta antes de renderizar a primeira linha, evitando o
+                # flash em posição 0 durante os primeiros frames.
+                if result.timecode_ms is not None and result.timecode_ms > 0:
+                    self._emit_compensated_timecode(
+                        result.timecode_ms,
+                        capture_start,
+                        "🎵 Timecode antes de lyrics_ready",
+                    )
+
                 self._emit('lyrics_ready', lyrics_text, lyrics_result.synced, capture_start)
-                
+
                 # 🎤 STT Sync: Atualizar letras e iniciar thread
                 self._update_stt_lyrics(lyrics_text)
                 self._start_stt_loop()
-                
-                # Update timecode
-                if result.timecode_ms is not None and result.timecode_ms > 0:
-                    self._emit('timecode_updated', result.timecode_ms, capture_start)
             else:
                 self._lyrics_cache[song_key] = None
                 self._emit('lyrics_not_found')
@@ -903,24 +947,26 @@ class RecognitionWorkerHeadless(threading.Thread):
                 self._current_lyrics_index = 0
             
             self._stt_matcher.set_lyrics(lines)
-            _LOG.debug(f"🎤 STT: Letras atualizadas ({len(lines)} linhas)")
+            _LOG.info("🎤 STT: Letras carregadas no matcher (%d linhas).", len(lines))
         except Exception as e:
             _LOG.error(f"❌ Erro ao atualizar lyrics STT: {e}")
 
     def _start_stt_loop(self) -> None:
-        """Inicia thread de STT se não estiver rodando."""
-        if not self._stt_enabled or not self._stt_recognizer:
+        """Inicia thread de STT se não estiver rodando (chamado após letra carregada)."""
+        # A thread já foi iniciada em run() — este método é no-op após a migração lazy.
+        pass
+
+    def _stt_init_and_loop(self) -> None:
+        """Carrega o modelo Whisper e entra no loop STT (roda inteiramente na thread STT)."""
+        if not _STT_AVAILABLE or not self._stt_enabled:
             return
-        
-        if not self._stt_running:
-            self._stt_running = True
-            self._stt_thread = threading.Thread(
-                target=self._stt_loop,
-                daemon=True,
-                name="STTSync"
-            )
-            self._stt_thread.start()
-            _LOG.info("🎤 STT thread iniciada")
+        # Inicializar modelo aqui — nunca no event loop do asyncio
+        self._init_stt()
+        if not self._stt_recognizer:
+            _LOG.error("❌ STT desativado: falha ao carregar modelo Whisper.")
+            return
+        self._stt_running = True
+        self._stt_loop()
 
     def _stop_stt_loop(self) -> None:
         """Para thread de STT."""
@@ -931,11 +977,17 @@ class RecognitionWorkerHeadless(threading.Thread):
     def _stt_loop(self) -> None:
         """Loop principal de processamento STT (roda em thread separada)."""
         chunk_duration = self._config.getfloat("SpeechSync", "chunk_duration_s", fallback=2.5)
-        
+        _waiting_logged = False
+
         while self._stt_running and not self._stop_flag.is_set():
             if self._pause_flag.is_set() or not self._current_lyrics_for_stt:
+                if not _waiting_logged:
+                    _LOG.info("🎤 STT aguardando letras da música atual...")
+                    _waiting_logged = True
                 time.sleep(0.1)
                 continue
+
+            _waiting_logged = False  # reset para logar novamente se perder as letras
             
             try:
                 # Capturar chunk de áudio
@@ -952,6 +1004,7 @@ class RecognitionWorkerHeadless(threading.Thread):
                     continue
                 
                 # Emit reconhecimento para debug
+                _LOG.info("🎤 STT reconheceu: '%s' (confiança=%.2f)", segment.text, segment.confidence)
                 self._emit('stt_recognized', segment.text, segment.confidence)
                 
                 # Encontrar match na letra
@@ -972,11 +1025,11 @@ class RecognitionWorkerHeadless(threading.Thread):
                             self._current_lyrics_index = match.line_index
                         
                         if old_index != match.line_index:
-                            _LOG.debug(f"🎤 STT: Linha {old_index} → {match.line_index} (similarity: {match.similarity:.2%})")
+                            _LOG.info("🎤 STT: sincronizou linha %d → %d (similaridade=%.0f%%).", old_index, match.line_index, match.similarity * 100)
                             self._emit('stt_matched', match.line_index, match.similarity)
                     
                     self._stt_last_segment = segment
             
             except Exception as e:
-                _LOG.error(f"❌ Erro em STT loop: {e}", exc_info=True)
+                _LOG.error("❌ Erro em STT loop: %s", e, exc_info=True)
                 time.sleep(1)

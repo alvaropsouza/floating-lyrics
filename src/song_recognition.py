@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import json as _json
 import logging
+import re
 import time as _time
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,6 +99,26 @@ class SongInfo:
     # Position (ms) in the song where our audio sample begins — from AudD's
     # `timecode` field.  Used to synchronise LRC lyrics.
     timecode_ms: int = 0
+
+    def __post_init__(self) -> None:
+        self.title = _clean_title(self.title)
+        self.album = _clean_title(self.album)
+
+
+# Padrões que algumas APIs adicionam ao título mas NÃO fazem parte dele.
+# Exemplos reais observados: "Snow (Hey Oh) [Chorus]", "Bohemian Rhapsody [Verse 2]"
+_TITLE_SECTION_RE = re.compile(
+    r'\s*[\[\(]'          # abre com [ ou (
+    r'(?:chorus|verse|bridge|intro|outro|pre[\s-]?chorus|hook|refrain|interlude|coda)'
+    r'(?:\s+\d+)?'        # número opcional (Verse 2)
+    r'[\]\)]',            # fecha
+    re.IGNORECASE,
+)
+
+
+def _clean_title(title: str) -> str:
+    """Remove tags de seção musical do título (ex: '[Chorus]', '(Verse 2)')."""
+    return _TITLE_SECTION_RE.sub("", title).strip()
 
 
 class AudDRecognizer:

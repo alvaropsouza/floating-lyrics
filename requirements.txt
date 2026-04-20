@@ -25,6 +25,9 @@ aiohttp>=3.9.0
 # Fast numeric audio processing (RMS, normalization — replaces pure-Python struct loops)
 numpy>=1.26.0
 
+# Resample de alta qualidade para STT (44100→16000 Hz sem aliasing)
+scipy>=1.11.0
+
 # Logs coloridos no terminal
 rich>=13.0.0
 

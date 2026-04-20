@@ -20,101 +20,128 @@ class AudioVisualizer extends StatefulWidget {
   State<AudioVisualizer> createState() => _AudioVisualizerState();
 }
 
-class _AudioVisualizerState extends State<AudioVisualizer> {
+class _AudioVisualizerState extends State<AudioVisualizer>
+    with SingleTickerProviderStateMixin {
   late List<double> _barHeights;
+  late AnimationController _ticker;
 
   @override
   void initState() {
     super.initState();
-    _barHeights = List.generate(widget.barCount, (_) => 0.1);
+    _barHeights = List.filled(widget.barCount, 0.0);
+
+    // Ticker de 60 FPS: interpola as barras em direção ao espectro mais recente
+    // sem depender do ritmo de notificações WebSocket.
+    _ticker = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 1),
+    )
+      ..addListener(_onTick)
+      ..repeat();
   }
 
-  void _updateSpectrum(List<double> spectrum) {
-    // Verificar se há dados de espectro válidos (não todos zeros ou ruído)
-    final hasValidSpectrum = spectrum.isNotEmpty &&
-        spectrum.any((v) => v > 0.1); // Threshold maior para ignorar ruído
+  void _onTick() {
+    // Lê o último espectro sem subscrever (sem rebuild cascata)
+    final spectrum = context.read<WebSocketService>().audioSpectrum;
 
-    if (hasValidSpectrum) {
-      // Usar dados reais do backend
-      _barHeights = List.from(spectrum);
-    } else {
-      // Decay suave quando não há áudio - barras vão para quase zero
-      for (int i = 0; i < _barHeights.length; i++) {
-        _barHeights[i] *= 0.75; // Decay mais rápido
-        if (_barHeights[i] < 0.02) _barHeights[i] = 0.01; // Mínimo bem baixo
-      }
+    bool changed = false;
+    for (int i = 0; i < _barHeights.length; i++) {
+      final target = i < spectrum.length ? spectrum[i].clamp(0.0, 1.0) : 0.0;
+      final prev = _barHeights[i];
+      // Subida rápida (0.7), descida mais suave (0.2)
+      final alpha = target > prev ? 0.85 : 0.45;
+      final next = prev + (target - prev) * alpha;
+      _barHeights[i] = next < 0.005 ? 0.0 : next;
+      if ((_barHeights[i] - prev).abs() > 0.001) changed = true;
     }
+
+    if (changed) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _ticker.dispose();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<WebSocketService>(
-      builder: (context, wsService, child) {
-        // Atualizar espectro a cada rebuild (quando service notifica)
-        _updateSpectrum(wsService.audioSpectrum);
-
-        return Container(
-          height: 120,
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topCenter,
-              end: Alignment.bottomCenter,
-              colors: [
-                Colors.black.withOpacity(0.8),
-                Colors.black.withOpacity(0.4),
-              ],
-            ),
-            border: Border.all(
-              color: widget.barColor.withOpacity(0.3),
-              width: 1,
-            ),
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: List.generate(
-                widget.barCount,
-                (index) => _buildBar(index),
-              ),
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  Widget _buildBar(int index) {
-    final height = _barHeights[index];
-    final maxHeight = 100.0;
-
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 100),
-      curve: Curves.easeOut,
-      width: 4,
-      height: height * maxHeight,
+    return Container(
+      height: 120,
       decoration: BoxDecoration(
         gradient: LinearGradient(
-          begin: Alignment.bottomCenter,
-          end: Alignment.topCenter,
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
           colors: [
-            widget.barColor,
-            widget.barColor.withOpacity(0.5),
+            Colors.black.withOpacity(0.8),
+            Colors.black.withOpacity(0.4),
           ],
         ),
-        borderRadius: BorderRadius.circular(2),
-        boxShadow: [
-          BoxShadow(
-            color: widget.barColor.withOpacity(0.5),
-            blurRadius: 4,
-            spreadRadius: 0,
+        border: Border.all(color: widget.barColor.withOpacity(0.3)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
+        child: CustomPaint(
+          size: Size.infinite,
+          painter: _BarsPainter(
+            heights: List.unmodifiable(_barHeights),
+            barCount: widget.barCount,
+            color: widget.barColor,
           ),
-        ],
+        ),
       ),
     );
   }
+}
+
+class _BarsPainter extends CustomPainter {
+  final List<double> heights;
+  final int barCount;
+  final Color color;
+
+  _BarsPainter({
+    required this.heights,
+    required this.barCount,
+    required this.color,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (heights.isEmpty) return;
+
+    final barWidth = 4.0;
+    final spacing = (size.width - barWidth * barCount) / (barCount + 1);
+    final maxHeight = size.height;
+
+    final paintBar = Paint()..style = PaintingStyle.fill;
+    final paintGlow = Paint()
+      ..color = color.withOpacity(0.35)
+      ..style = PaintingStyle.fill
+      ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3);
+
+    for (int i = 0; i < barCount; i++) {
+      final h = (heights[i].clamp(0.0, 1.0)) * maxHeight;
+      final x = spacing + i * (barWidth + spacing);
+      final rect = RRect.fromRectAndRadius(
+        Rect.fromLTWH(x, maxHeight - h, barWidth, h),
+        const Radius.circular(2),
+      );
+
+      // Gradiente por barra (do bottom-color ao top-color)
+      paintBar.shader = LinearGradient(
+        begin: Alignment.bottomCenter,
+        end: Alignment.topCenter,
+        colors: [color, color.withOpacity(0.5)],
+      ).createShader(Rect.fromLTWH(x, maxHeight - h, barWidth, h));
+
+      canvas.drawRRect(rect, paintGlow);
+      canvas.drawRRect(rect, paintBar);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_BarsPainter old) => true;
 }
 
 /// Visualizer estilo onda/waveform (alternativo)
@@ -246,5 +273,6 @@ class _WavePainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(_WavePainter oldDelegate) => true;
+  bool shouldRepaint(_WavePainter oldDelegate) =>
+      oldDelegate.points != points || oldDelegate.color != color;
 }

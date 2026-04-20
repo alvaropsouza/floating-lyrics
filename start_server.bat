@@ -4,6 +4,11 @@ REM
 REM Uso: Clique duas vezes neste arquivo
 REM      OU execute: .\start_server.bat
 
+set "RELOAD=1"
+for %%a in (%*) do (
+    if /I "%%a"=="--no-reload" set "RELOAD=0"
+)
+
 echo.
 echo ============================================================
 echo   Floating Lyrics - Backend Server
@@ -62,10 +67,19 @@ echo [*] Iniciando servidor backend (headless - sem PyQt6)...
 echo.
 echo [i] O servidor exibira a porta WebSocket em uso
 echo [i] Pressione Ctrl+C para parar
+if "%RELOAD%"=="1" (
+    echo [i] Auto-reload: ativo (reinicia ao salvar .py)
+) else (
+    echo [i] Auto-reload: desativado (--no-reload)
+)
 echo.
 
 REM Rodar servidor headless
-python main_server_headless.py
+if "%RELOAD%"=="1" (
+    python main_server_headless.py --reload
+) else (
+    python main_server_headless.py
+)
 
 if errorlevel 1 (
     echo.

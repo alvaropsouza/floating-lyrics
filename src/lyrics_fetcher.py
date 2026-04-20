@@ -62,6 +62,14 @@ def _slug(s: str) -> str:
     return cleaned or "unknown"
 
 
+def _safe_future_result(fut) -> Optional["LyricsResult"]:
+    """Extrai o resultado de um Future, retornando None em caso de exceção."""
+    try:
+        return fut.result()
+    except Exception:
+        return None
+
+
 
 class LrcLibFetcher:
     """
@@ -72,12 +80,11 @@ class LrcLibFetcher:
 
     BASE_URL = "https://lrclib.net/api"
     TIMEOUT = 5  # Reduzido para evitar bloqueios longos
+    _USER_AGENT = "FloatingLyrics/1.0 (https://github.com/floating-lyrics)"
 
     def __init__(self) -> None:
         self._session = requests.Session()
-        self._session.headers.update(
-            {"User-Agent": "FloatingLyrics/1.0 (https://github.com/floating-lyrics)"}
-        )
+        self._session.headers.update({"User-Agent": self._USER_AGENT})
 
     def fetch(
         self,
@@ -86,36 +93,89 @@ class LrcLibFetcher:
         album: str = "",
         duration_s: int = 0,
     ) -> Optional[LyricsResult]:
+        """Dispara todas as estratégias de busca em paralelo e retorna o primeiro hit sincronizado."""
+        tasks = self._build_parallel_tasks(title, artist, album, duration_s)
+        return self._await_best_result(tasks)
+
+    def _build_parallel_tasks(self, title: str, artist: str, album: str, duration_s: int) -> list:
+        """Cria e submete todas as tarefas de busca para um ThreadPoolExecutor."""
         duration = max(0, int(duration_s or 0))
-
-        # Para artistas compostos (ex: "Snoop Dogg, Wiz Khalifa, Bruno Mars"),
-        # tentar também com apenas o primeiro artista listado
         first_artist = _ARTIST_SPLIT_RE.split(artist)[0].strip()
-
-        # Fire all duration candidates in parallel to avoid sequential HTTP waits.
+        plain_artist = _strip_accents(artist)
+        plain_title = _strip_accents(title)
         candidates = self._duration_candidates(duration)
-        if len(candidates) == 1:
-            data = self._get_by_signature(title, artist, album, candidates[0])
-            result = self._parse_response(data) if data is not None else None
-            # Tentar com primeiro artista se artista composto e não encontrou
-            if result is None and first_artist and first_artist.lower() != artist.lower():
-                data = self._get_by_signature(title, first_artist, album, candidates[0])
-                result = self._parse_response(data) if data is not None else None
-        else:
-            result = self._parallel_get(title, artist, album, candidates)
-            if result is None and first_artist and first_artist.lower() != artist.lower():
-                result = self._parallel_get(title, first_artist, album, candidates)
+        base_url, timeout = self.BASE_URL, self.TIMEOUT
 
-        if result is not None:
-            return result
+        pool = ThreadPoolExecutor(max_workers=8)
+        tasks: list = []
 
-        # No signature match: search and rank by title/artist similarity + duration.
-        return self._search(title, artist, duration)
+        # /get — artista principal, todos os candidatos de duração
+        for d in candidates:
+            tasks.append(pool.submit(
+                self._fetch_one_candidate, base_url, title, artist, album, d, timeout,
+            ))
+        # /get — primeiro artista (artistas compostos "A, B, C" → "A")
+        if first_artist and first_artist.lower() != artist.lower():
+            for d in candidates:
+                tasks.append(pool.submit(
+                    self._fetch_one_candidate, base_url, title, first_artist, album, d, timeout,
+                ))
+        # /search — query principal: "{artista} {título}"
+        tasks.append(pool.submit(
+            self._search_one_isolated,
+            f"{artist} {title}", title, artist, duration, base_url, timeout,
+        ))
+        # /search — query sem acentos (diferença NFC/NFD)
+        if plain_artist != artist or plain_title != title:
+            tasks.append(pool.submit(
+                self._search_one_isolated,
+                f"{plain_artist} {plain_title}", title, artist, duration, base_url, timeout,
+            ))
+        # /search — query com primeiro artista
+        if first_artist and first_artist.lower() != artist.lower():
+            tasks.append(pool.submit(
+                self._search_one_isolated,
+                f"{first_artist} {title}", title, first_artist, duration, base_url, timeout,
+            ))
+
+        _LOG.debug(
+            "lrclib: %d tarefas paralelas para '%s' – '%s'",
+            len(tasks), title, artist,
+        )
+        # Registrar shutdown do pool ao encerrar as tarefas via _await_best_result
+        tasks.append(pool)  # último elemento é o pool para shutdown
+        return tasks
+
+    @staticmethod
+    def _await_best_result(tasks: list) -> Optional[LyricsResult]:
+        """Aguarda o melhor resultado das tarefas paralelas (sinc > plain)."""
+        futures = [t for t in tasks if hasattr(t, 'result')]
+        pool_obj = tasks[-1] if tasks and hasattr(tasks[-1], 'shutdown') else None
+
+        best_plain: Optional[LyricsResult] = None
+        synced_hit: Optional[LyricsResult] = None
+        try:
+            for fut in as_completed(futures):
+                res = _safe_future_result(fut)
+                if res is None:
+                    continue
+                if res.synced:
+                    synced_hit = res
+                    for f in futures:
+                        f.cancel()
+                    break
+                if best_plain is None:
+                    best_plain = res
+        finally:
+            if pool_obj is not None:
+                pool_obj.shutdown(wait=False, cancel_futures=True)
+
+        return synced_hit if synced_hit is not None else best_plain
 
     @staticmethod
     def _fetch_one_candidate(base_url: str, title: str, artist: str, album: str, dur: int, timeout: int) -> Optional[LyricsResult]:
         session = requests.Session()
-        session.headers.update({"User-Agent": "FloatingLyrics/1.0 (https://github.com/floating-lyrics)"})
+        session.headers.update({"User-Agent": LrcLibFetcher._USER_AGENT})
         params: dict = {"track_name": title, "artist_name": artist}
         if album:
             params["album_name"] = album
@@ -129,6 +189,34 @@ class LrcLibFetcher:
             pass
         finally:
             session.close()
+        return None
+
+    @staticmethod
+    def _search_one_isolated(query: str, title: str, artist: str, duration_s: int, base_url: str, timeout: int) -> Optional[LyricsResult]:
+        """Executa uma única query /search com sessão própria (thread-safe)."""
+        session = requests.Session()
+        session.headers.update({"User-Agent": LrcLibFetcher._USER_AGENT})
+        try:
+            r = session.get(f"{base_url}/search", params={"q": query}, timeout=timeout)
+            r.raise_for_status()
+            results = _safe_json(r)
+        except (requests.RequestException, ValueError):
+            return None
+        finally:
+            session.close()
+
+        if not isinstance(results, list) or not results:
+            return None
+
+        ranked = sorted(
+            results,
+            key=lambda item: LrcLibFetcher._score_candidate(item, title, artist, duration_s),
+            reverse=True,
+        )
+        for item in ranked:
+            parsed = LrcLibFetcher._parse_response(item)
+            if parsed is not None:
+                return parsed
         return None
 
     def _parallel_get(
@@ -409,13 +497,91 @@ class MusixmatchFetcher:
             pass
 
 
+class AudCRLyricsFetcher:
+    """
+    Fetches plain lyrics using AudCR/AudD findLyrics endpoint.
+
+    Endpoint tested: https://api.audd.io/findLyrics/
+    """
+
+    DEFAULT_BASE_URL = "https://api.audd.io/findLyrics/"
+    TIMEOUT = 8
+
+    def __init__(self, api_token: str, base_url: str = "") -> None:
+        self.api_token = (api_token or "").strip()
+        self.base_url = (base_url or self.DEFAULT_BASE_URL).strip() or self.DEFAULT_BASE_URL
+        self._session = requests.Session()
+        self._session.headers.update({"User-Agent": "FloatingLyrics/1.0"})
+
+    def fetch(self, title: str, artist: str) -> Optional[LyricsResult]:
+        if not self.api_token:
+            return None
+
+        query = f"{artist} {title}".strip()
+        try:
+            r = self._session.get(
+                self.base_url,
+                params={
+                    "api_token": self.api_token,
+                    "q": query,
+                },
+                timeout=self.TIMEOUT,
+            )
+            r.raise_for_status()
+            data = _safe_json(r)
+        except Exception:
+            _LOG.warning("AudCR findLyrics falhou", exc_info=True)
+            return None
+
+        if not isinstance(data, dict) or data.get("status") != "success":
+            return None
+
+        result = data.get("result")
+        if isinstance(result, dict):
+            candidates = [result]
+        elif isinstance(result, list):
+            candidates = [item for item in result if isinstance(item, dict)]
+        else:
+            return None
+
+        if not candidates:
+            return None
+
+        target_title = _strip_accents(_normalize_str(title))
+        target_artist = _strip_accents(_normalize_str(artist))
+
+        def _candidate_score(item: dict) -> float:
+            cand_title = _strip_accents(_normalize_str(str(item.get("title") or "")))
+            cand_artist = _strip_accents(_normalize_str(str(item.get("artist") or "")))
+            title_sim = SequenceMatcher(None, target_title, cand_title).ratio()
+            artist_sim = SequenceMatcher(None, target_artist, cand_artist).ratio()
+            return 0.6 * title_sim + 0.4 * artist_sim
+
+        best = max(candidates, key=_candidate_score)
+        lyrics = str(best.get("lyrics") or "").strip()
+        if not lyrics:
+            return None
+
+        lines = [ln.rstrip() for ln in lyrics.splitlines()]
+        if not any(ln.strip() for ln in lines):
+            return None
+
+        return LyricsResult(lines=lines, synced=False)
+
+    def __del__(self) -> None:
+        try:
+            self._session.close()
+        except Exception:
+            pass
+
+
 # ── Orchestrator ─────────────────────────────────────────────────────────────
 
 class LyricsFetcher:
     """
     Tries each lyrics source in priority order and returns the first result.
 
-    Priority: lrclib.net (synced) → lrclib.net (plain) → Musixmatch (plain).
+    Priority default: lrclib.net (synced/plain) → Musixmatch (plain) → AudCR (plain).
     """
 
     def __init__(self, config) -> None:
@@ -423,15 +589,44 @@ class LyricsFetcher:
         self._musixmatch = MusixmatchFetcher(
             config.get("API", "musixmatch_api_key", fallback="")
         )
+        audcr_base_url = config.get(
+            "Lyrics",
+            "audcr_endpoint",
+            fallback="https://api.audd.io/findLyrics/",
+        )
+        audcr_token = config.get("API", "audcr_api_key", fallback="") or config.get(
+            "API", "audd_api_key", fallback=""
+        )
+        self._audcr = AudCRLyricsFetcher(audcr_token, base_url=audcr_base_url)
+        raw_order = config.get(
+            "Lyrics",
+            "provider_fallback_order",
+            fallback="lrclib,musixmatch,audcr",
+        )
+        self._provider_order = self._parse_provider_order(raw_order)
         # In-memory cache to avoid repeated remote calls for the same song.
         # Value is Optional[LyricsResult]: None means "already checked, not found".
         self._cache: dict[tuple[str, str, str, int], Optional[LyricsResult]] = {}
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
+    def _parse_provider_order(raw_order: str) -> list[str]:
+        allowed = {"lrclib", "musixmatch", "audcr"}
+        tokens = [token.strip().lower() for token in (raw_order or "").split(",")]
+        order: list[str] = []
+        for token in tokens:
+            if token in allowed and token not in order:
+                order.append(token)
+        if not order:
+            return ["lrclib", "musixmatch", "audcr"]
+        return order
+
+    @staticmethod
     def _disk_path(title: str, artist: str, album: str) -> Path:
-        filename = f"{_slug(artist)}__{_slug(title)}__{_slug(album)}.txt"
-        return _CACHE_DIR / filename
+        artist_dir = _slug(artist) or "unknown-artist"
+        album_dir  = _slug(album)  or "unknown-album"
+        filename   = f"{_slug(title)}.txt"
+        return _CACHE_DIR / artist_dir / album_dir / filename
 
     @staticmethod
     def _serialize_result(
@@ -488,7 +683,7 @@ class LyricsFetcher:
             if parsed is None:
                 _LOG.warning("Cache de letra inválido, ignorando: %s", path)
                 return None
-            _LOG.info("Letra carregada do cache em disco: %s", path.name)
+            _LOG.info("Letra carregada do cache em disco: %s", path.relative_to(_CACHE_DIR))
             return parsed
         except Exception:
             _LOG.warning("Falha ao ler cache de letra: %s", path, exc_info=True)
@@ -504,11 +699,12 @@ class LyricsFetcher:
     ) -> None:
         path = self._disk_path(title, artist, album)
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
                 self._serialize_result(title, artist, album, duration_s, result),
                 encoding="utf-8",
             )
-            _LOG.info("Letra salva no cache em disco: %s", path.name)
+            _LOG.info("Letra salva no cache em disco: %s", path.relative_to(_CACHE_DIR))
         except Exception:
             _LOG.warning("Falha ao salvar cache de letra: %s", path, exc_info=True)
 
@@ -543,17 +739,23 @@ class LyricsFetcher:
             self._cache[key] = cached_disk
             return cached_disk
 
-        # 1 — lrclib.net (free, supports LRC sync)
-        result = self._lrclib.fetch(title, artist, album, duration_s)
-        if result is not None:
-            self._cache[key] = result
-            self._save_disk_cache(title, artist, album, duration_s, result)
-            return result
+        result: Optional[LyricsResult] = None
+        for provider in self._provider_order:
+            if provider == "lrclib":
+                result = self._lrclib.fetch(title, artist, album, duration_s)
+            elif provider == "musixmatch":
+                result = self._musixmatch.fetch(title, artist)
+            elif provider == "audcr":
+                result = self._audcr.fetch(title, artist)
+            else:
+                continue
 
-        # 2 — Musixmatch fallback (plain text)
-        result = self._musixmatch.fetch(title, artist)
+            if result is not None:
+                _LOG.info("Letra encontrada via provedor: %s", provider)
+                self._cache[key] = result
+                self._save_disk_cache(title, artist, album, duration_s, result)
+                return result
+
         # Cache both hits and misses so we don't spam providers.
         self._cache[key] = result
-        if result is not None:
-            self._save_disk_cache(title, artist, album, duration_s, result)
         return result

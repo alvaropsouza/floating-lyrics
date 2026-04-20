@@ -15,6 +15,7 @@ CONFIG_FILE = Path(__file__).parent / "config.ini"
 _DEFAULTS: dict[str, dict[str, str]] = {
     "API": {
         "audd_api_key": "",
+        "audcr_api_key": "",
         "llm_api_key": "",
         "musixmatch_api_key": "",
     },
@@ -49,6 +50,8 @@ _DEFAULTS: dict[str, dict[str, str]] = {
         "local_change_min_energy": "0.08",
         "local_change_ema_alpha": "0.05",
         "local_change_cooldown_s": "5",
+        "silence_recovery_frames": "8",
+        "silence_recovery_energy_multiplier": "1.8",
         "new_song_max_attempts": "12",
         "new_song_attempt_cooldown_s": "120",
         "capture_duration": "10",
@@ -76,6 +79,10 @@ _DEFAULTS: dict[str, dict[str, str]] = {
     },
     "Preferences": {
         "start_minimized": "false",
+    },
+    "Lyrics": {
+        "provider_fallback_order": "lrclib,musixmatch,audcr",
+        "audcr_endpoint": "https://api.audd.io/findLyrics/",
     },
 }
 
