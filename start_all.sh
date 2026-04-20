@@ -41,8 +41,8 @@ if [ -z "${VIRTUAL_ENV:-}" ] && [ -f ".venv/Scripts/activate" ]; then
     source ".venv/Scripts/activate"
 fi
 
-echo "[*] Iniciando llm-music-api em modo dev..."
-"$ROOT_DIR/llm-music-api/start-dev.sh"
+# echo "[*] Iniciando llm-music-api localmente (sem Docker)..."
+# "$ROOT_DIR/llm-music-api/start-local.sh" &
 
 if ! python -c "import aiohttp" >/dev/null 2>&1; then
     echo "[*] Instalando dependencias Python headless..."
@@ -63,7 +63,7 @@ done
 
 if [ "$START_FRONTEND" = false ]; then
     echo "[*] Modo sem frontend habilitado (--no-front)."
-    echo "[OK] API + backend headless iniciados."
+    echo "[OK] Backend headless iniciado na porta 8765."
     echo "[*] Mantendo processo ativo. Pressione Ctrl+C para encerrar."
     wait "${BACKEND_PID}"
 else

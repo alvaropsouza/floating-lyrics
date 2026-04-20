@@ -173,6 +173,12 @@ class AudDRecognizer:
             data["api_token"] = self.api_key
 
         files = {"file": ("audio.wav", audio_bytes, "audio/wav")}
+        
+        # Log da requisição
+        api_key_masked = f"{self.api_key[:8]}..." if len(self.api_key) > 8 else "***"
+        _LOG.debug(f"🌐 AudD REQUEST → POST {self.BASE_URL}")
+        _LOG.debug(f"   Params: return={data['return']}, api_token={api_key_masked}")
+        _LOG.debug(f"   Audio size: {len(audio_bytes)} bytes")
 
         try:
             resp = self._session.post(
@@ -181,6 +187,16 @@ class AudDRecognizer:
                 files=files,
                 timeout=(self.CONNECT_TIMEOUT_S, self.TIMEOUT_S),
             )
+            
+            # Log da resposta
+            _LOG.debug(f"🌐 AudD RESPONSE ← Status {resp.status_code}")
+            try:
+                resp_json = resp.json()
+                resp_str = _json.dumps(resp_json, ensure_ascii=False)[:500]
+                _LOG.debug(f"   Body: {resp_str}{'...' if len(resp.text) > 500 else ''}")
+            except Exception:
+                _LOG.debug(f"   Body (raw): {resp.text[:200]}")
+            
             resp.raise_for_status()
         except requests.Timeout:
             _LOG.warning("AudD timeout")
@@ -377,6 +393,11 @@ class ACRCloudRecognizer:
             "timestamp":         timestamp,
         }
 
+        # Log da requisição
+        _LOG.debug(f"🌐 ACRCloud REQUEST → POST {self._endpoint}")
+        _LOG.debug(f"   access_key={self.access_key[:8]}..., timestamp={timestamp}")
+        _LOG.debug(f"   Audio size: {len(audio_bytes)} bytes")
+        
         try:
             resp = self._session.post(
                 self._endpoint,
@@ -384,6 +405,16 @@ class ACRCloudRecognizer:
                 files={"sample": ("audio.wav", audio_bytes, "audio/wav")},
                 timeout=(self.CONNECT_TIMEOUT_S, self.TIMEOUT_S),
             )
+            
+            # Log da resposta
+            _LOG.debug(f"🌐 ACRCloud RESPONSE ← Status {resp.status_code}")
+            try:
+                resp_json = resp.json()
+                resp_str = _json.dumps(resp_json, ensure_ascii=False)[:500]
+                _LOG.debug(f"   Body: {resp_str}{'...' if len(resp.text) > 500 else ''}")
+            except Exception:
+                _LOG.debug(f"   Body (raw): {resp.text[:200]}")
+            
             resp.raise_for_status()
         except requests.Timeout:
             _LOG.warning("ACRCloud timeout")
@@ -481,314 +512,170 @@ class ACRCloudRecognizer:
             pass
 
 
-class LLMAPIRecognizer:
-    """Identifies songs using the local llm-music-api service."""
+# ── AcoustID recognizer ──────────────────────────────────────────────────────
 
-    TIMEOUT_S = 8
-    CONNECT_TIMEOUT_S = 3
-    INDEX_NOT_TRAINED_PAUSE_S = 15 * 60
-    PAYLOAD_TOO_LARGE_PAUSE_S = 10 * 60
-
-    def __init__(
-        self,
-        base_url: str = "http://127.0.0.1:3000",
-        api_key: str = "",
-        top_k: int = 3,
-    ) -> None:
-        self.base_url = (base_url or "http://127.0.0.1:3000").strip().rstrip("/")
-        self.api_key = (api_key or "").strip()
-        self.top_k = max(1, int(top_k or 3))
+class AcoustIDRecognizer:
+    """
+    Identifies songs using AcoustID (Chromaprint + MusicBrainz).
+    
+    Free tier: Unlimited requests (requires free API key).
+    Sign up at: https://acoustid.org/new-application
+    
+    Uses audio fingerprinting (Chromaprint) to query MusicBrainz database.
+    Works best for popular/release music catalogued on MusicBrainz.
+    """
+    
+    TIMEOUT_S = 10
+    CONNECT_TIMEOUT_S = 5
+    
+    def __init__(self, api_key: str = "") -> None:
+        self.api_key = api_key.strip()
         self._session = AudDRecognizer._create_optimized_session()
-
-    @property
-    def _endpoint(self) -> str:
-        return f"{self.base_url}/identify/audio"
-
-    @staticmethod
-    def _safe_int(value) -> int:
-        try:
-            return int(float(value))
-        except (TypeError, ValueError):
-            return 0
-
-    @staticmethod
-    def _safe_float(value) -> Optional[float]:
-        try:
-            if value is None:
-                return None
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _is_index_not_trained_message(message: str) -> bool:
-        normalized = (message or "").strip().lower()
-        return (
-            "index de audio" in normalized
-            and "nao treinado" in normalized
-        )
-
+        
     def recognize(
         self, audio_bytes: bytes, capture_start_time: float
     ) -> Tuple[Optional[SongInfo], float]:
-        if not self.base_url:
-            raise RecognitionError(
-                "LLM API não configurada. Defina a URL base em Configurações."
-            )
-
-        # Salvar áudio para debug se configurado
-        _save_debug_audio(audio_bytes, provider_name="llm_api")
-
-        headers = {}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        payload = {
-            "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
-            "top_k": self.top_k,
-        }
-
-        try:
-            resp = self._session.post(
-                self._endpoint,
-                json=payload,
-                headers=headers,
-                timeout=(self.CONNECT_TIMEOUT_S, self.TIMEOUT_S),
-            )
-            resp.raise_for_status()
-        except requests.Timeout:
-            _LOG.warning("LLM API timeout")
-            raise RecognitionError("Timeout ao conectar na LLM API.")
-        except requests.ConnectionError:
-            _LOG.warning("LLM API sem conexão")
-            raise RecognitionError(
-                "LLM API indisponível. Verifique se o serviço está rodando."
-            )
-        except requests.HTTPError as exc:
-            _LOG.error("LLM API HTTP %s", exc.response.status_code)
-            if exc.response is not None:
-                status_code = exc.response.status_code
-                body_message = ""
-                try:
-                    parsed_error = _json.loads(exc.response.content.decode("utf-8"))
-                    if isinstance(parsed_error, dict):
-                        body_message = (
-                            parsed_error.get("message")
-                            or parsed_error.get("error")
-                            or ""
-                        )
-                except Exception:
-                    body_message = ""
-
-                if status_code == 413:
-                    raise RateLimitError(
-                        "LLM API rejeitou payload grande (HTTP 413). Pausando provedor temporariamente.",
-                        seconds_left=self.PAYLOAD_TOO_LARGE_PAUSE_S,
-                    ) from exc
-
-                if (
-                    status_code == 400
-                    and self._is_index_not_trained_message(body_message)
-                ):
-                    raise RateLimitError(
-                        "Index de áudio do LLM não treinado. Execute /recognition/train. Pausando provedor temporariamente.",
-                        seconds_left=self.INDEX_NOT_TRAINED_PAUSE_S,
-                    ) from exc
-
-            raise RecognitionError(
-                f"Erro HTTP {exc.response.status_code} da LLM API."
-            ) from exc
-
-        try:
-            parsed = _json.loads(resp.content.decode("utf-8"))
-        except ValueError:
-            raise RecognitionError("Resposta inesperada da LLM API (não é JSON).")
-
-        if isinstance(parsed, dict) and parsed.get("success") is False:
-            message = parsed.get("message") or parsed.get("error") or "Erro desconhecido"
-            if self._is_index_not_trained_message(message):
-                raise RateLimitError(
-                    "Index de áudio do LLM não treinado. Execute /recognition/train. Pausando provedor temporariamente.",
-                    seconds_left=self.INDEX_NOT_TRAINED_PAUSE_S,
-                )
-            raise RecognitionError(f"LLM API: {message}")
-
-        song = self._parse(parsed)
-        return song, capture_start_time
-
-    def _parse(self, payload: dict) -> Optional[SongInfo]:
-        if not isinstance(payload, dict):
-            raise RecognitionError("Resposta inesperada da LLM API.")
-
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-        title = (data.get("song") or data.get("title") or "").strip()
-        if not title:
-            return None
-
-        artist = (data.get("artist") or "").strip()
-        album = (data.get("album") or "").strip()
-        duration_s = self._safe_int(
-            data.get("duration_s")
-            or data.get("duration")
-            or (data.get("metadata") or {}).get("duration_s")
-        )
-        timecode_ms = self._safe_int(data.get("timecode_ms") or data.get("timecode"))
-        confidence = self._safe_float(data.get("confidence"))
-
-        return SongInfo(
-            title=title,
-            artist=artist,
-            album=album,
-            duration_s=duration_s,
-            confidence=confidence,
-            timecode_ms=max(0, timecode_ms),
-        )
-
-    def __del__(self) -> None:
-        try:
-            self._session.close()
-        except Exception:
-            pass
-
-
-class LLMAPITrainer:
-    """Dispara o treino do índice de áudio na llm-music-api."""
-
-    TIMEOUT_S = 30
-    CONNECT_TIMEOUT_S = 3
-
-    def __init__(
-        self,
-        base_url: str = "http://127.0.0.1:3000",
-        api_key: str = "",
-        dataset_path: str = "/app/training_audio",
-    ) -> None:
-        self.base_url = (base_url or "http://127.0.0.1:3000").strip().rstrip("/")
-        self.api_key = (api_key or "").strip()
-        self.dataset_path = (dataset_path or "/app/training_audio").strip()
-        self._session = AudDRecognizer._create_optimized_session()
-
-    @property
-    def _endpoint(self) -> str:
-        return f"{self.base_url}/recognition/train"
-
-    def trigger_training(self, dataset_path: Optional[str] = None) -> dict[str, Any]:
-        headers = {}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        payload: dict[str, str] = {}
-        effective_dataset_path = (dataset_path or self.dataset_path).strip()
-        if effective_dataset_path:
-            payload["dataset_path"] = effective_dataset_path
-
-        try:
-            resp = self._session.post(
-                self._endpoint,
-                json=payload,
-                headers=headers,
-                timeout=(self.CONNECT_TIMEOUT_S, self.TIMEOUT_S),
-            )
-            resp.raise_for_status()
-        except requests.Timeout as exc:
-            raise RecognitionError("Timeout ao disparar treino da LLM API.") from exc
-        except requests.ConnectionError as exc:
-            raise RecognitionError("Sem conexão com a LLM API para treino.") from exc
-        except requests.HTTPError as exc:
-            try:
-                parsed = _json.loads(exc.response.content.decode("utf-8"))
-                message = parsed.get("message") or parsed.get("error") or ""
-            except Exception:
-                message = ""
-            detail = f": {message}" if message else ""
-            raise RecognitionError(
-                f"Erro HTTP {exc.response.status_code} ao treinar LLM API{detail}"
-            ) from exc
-
-        try:
-            parsed = _json.loads(resp.content.decode("utf-8"))
-        except ValueError as exc:
-            raise RecognitionError("Resposta inesperada da rota de treino da LLM API.") from exc
-
-        if isinstance(parsed, dict) and parsed.get("success") is False:
-            message = parsed.get("message") or parsed.get("error") or "Erro desconhecido"
-            raise RecognitionError(f"Falha no treino da LLM API: {message}")
-
-        if isinstance(parsed, dict):
-            data = parsed.get("data")
-            if isinstance(data, dict):
-                return data
-            return parsed
-
-        raise RecognitionError("Resposta inesperada da rota de treino da LLM API.")
-
-    def __del__(self) -> None:
-        try:
-            self._session.close()
-        except Exception:
-            pass
-
-
-class LLMSearchClient:
-    """Busca metadados + letras via endpoint /search da llm-music-api.
-
-    Recebe apenas um título e retorna artista, álbum, letras e confiança.
-    """
-
-    TIMEOUT_S = 30
-    CONNECT_TIMEOUT_S = 3
-
-    def __init__(
-        self,
-        base_url: str = "http://127.0.0.1:3000",
-    ) -> None:
-        self.base_url = (base_url or "http://127.0.0.1:3000").strip().rstrip("/")
-        self._session = AudDRecognizer._create_optimized_session()
-
-    @property
-    def _endpoint(self) -> str:
-        return f"{self.base_url}/search"
-
-    def search(self, title: str) -> Optional[dict[str, Any]]:
-        """Envia título e recebe metadados + letras da LLM API.
-
-        Returns dict com chaves: title, artist, album, lyrics, synced, confidence, sources
-        ou None se falhou.
         """
-        if not title or not title.strip():
-            return None
-
-        try:
-            resp = self._session.post(
-                self._endpoint,
-                json={"title": title.strip()},
-                timeout=(self.CONNECT_TIMEOUT_S, self.TIMEOUT_S),
+        Send audio_bytes (WAV) to AcoustID for identification.
+        
+        Args:
+            audio_bytes: WAV data captured from WASAPI loopback.
+            capture_start_time: time.perf_counter() value before capture.
+        
+        Returns:
+            (SongInfo, capture_start_time) on success, or
+            (None, capture_start_time) when song was not recognized.
+        
+        Raises:
+            RecognitionError: for network errors or API-level errors.
+        """
+        if not self.api_key:
+            raise RecognitionError(
+                "AcoustID não configurado.\n"
+                "Obtenha uma chave gratuita em https://acoustid.org/ e configure em config.ini"
             )
-            resp.raise_for_status()
-        except requests.Timeout:
-            _LOG.warning("LLM /search timeout")
-            return None
-        except requests.ConnectionError:
-            _LOG.debug("LLM /search indisponível")
-            return None
-        except requests.HTTPError as exc:
-            _LOG.warning("LLM /search HTTP %s", exc.response.status_code if exc.response else "?")
-            return None
-
+        
+        _save_debug_audio(audio_bytes, provider_name="acoustid")
+        
         try:
-            parsed = _json.loads(resp.content.decode("utf-8"))
-        except ValueError:
-            return None
-
-        if not isinstance(parsed, dict) or not parsed.get("success"):
-            return None
-
-        data = parsed.get("data")
-        if not isinstance(data, dict):
-            return None
-
-        return data
-
+            import acoustid
+        except ImportError:
+            raise RecognitionError(
+                "Biblioteca 'pyacoustid' não instalada.\n"
+                "Execute: pip install pyacoustid"
+            )
+        
+        import tempfile
+        import os
+        from pathlib import Path
+        
+        # Salvar WAV temporário (acoustid precisa de arquivo, não bytes direto)
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+        
+        # Procurar fpcalc.exe na pasta bin/ ou no PATH
+        fpcalc_path = None
+        local_fpcalc = Path(__file__).parent.parent / "bin" / "fpcalc.exe"
+        _LOG.debug(f"Procurando fpcalc em: {local_fpcalc}")
+        if local_fpcalc.exists():
+            fpcalc_path = str(local_fpcalc)
+            _LOG.debug(f"✓ fpcalc encontrado em: {fpcalc_path}")
+            # Adicionar bin/ ao PATH temporariamente para garantir que acoustid encontre
+            bin_dir = str(local_fpcalc.parent)
+            if bin_dir not in os.environ.get('PATH', ''):
+                os.environ['PATH'] = bin_dir + os.pathsep + os.environ.get('PATH', '')
+                _LOG.debug(f"Adicionado {bin_dir} ao PATH")
+        else:
+            _LOG.warning(f"✗ fpcalc não encontrado em: {local_fpcalc}")
+            _LOG.info("Tentando usar fpcalc do PATH do sistema...")
+        
+        try:
+            # Gerar fingerprint usando fpcalc (permite especificar comando customizado)
+            if fpcalc_path:
+                _LOG.debug(f"Usando fpcalc customizado: {fpcalc_path}")
+                duration, fingerprint = acoustid.fingerprint_file(tmp_path, fpcalc_path)
+            else:
+                _LOG.debug("Usando fpcalc do PATH")
+                duration, fingerprint = acoustid.fingerprint_file(tmp_path)
+            
+            # Fazer lookup no AcoustID com a fingerprint (meta='recordings' para obter título e artista)
+            _LOG.debug(f"🌐 AcoustID REQUEST → lookup(fingerprint, duration={duration}, meta='recordings')")
+            _LOG.debug(f"   api_key={self.api_key[:8]}...")
+            
+            results = list(acoustid.lookup(self.api_key, fingerprint, duration, meta='recordings'))
+            
+            _LOG.debug(f"🌐 AcoustID RESPONSE ← {len(results)} result(s)")
+            if results:
+                _LOG.debug(f"   Results preview: {str(results)[:300]}...")
+            
+            if not results:
+                return None, capture_start_time
+            
+            # Processar resultados do lookup (retorna dicionários)
+            # Estrutura: [{'score': float, 'id': str, 'recordings': [{'title': str, 'artists': [{'name': str}]}]}]
+            # Nota: acoustid.lookup pode retornar strings de erro/status, filtrar apenas dicts
+            best_match = None
+            best_score = 0.0
+            
+            for result in results:
+                # Validar que result é um dicionário
+                if not isinstance(result, dict):
+                    _LOG.debug(f"AcoustID retornou resultado não-dict: {type(result).__name__}")
+                    continue
+                
+                score = result.get('score', 0.0)
+                if score > best_score and 'recordings' in result and result['recordings']:
+                    recording = result['recordings'][0]
+                    title = recording.get('title')
+                    artists = recording.get('artists', [])
+                    artist = artists[0]['name'] if artists else None
+                    
+                    if title and artist:
+                        best_match = (score, title, artist)
+                        best_score = score
+            
+            if not best_match:
+                return None, capture_start_time
+            
+            score, title, artist = best_match
+            
+            # AcoustID retorna score 0-1, mas queremos percentual
+            confidence = float(score) if score is not None else None
+            
+            _LOG.debug(f"AcoustID match: {title} - {artist} (score: {confidence})")
+            
+            return SongInfo(
+                title=title.strip(),
+                artist=artist.strip(),
+                album="",  # AcoustID não retorna álbum diretamente
+                duration_s=0,  # Não disponível na resposta básica
+                confidence=confidence,
+                timecode_ms=0,  # AcoustID não fornece timecode
+            ), capture_start_time
+            
+        except acoustid.NoBackendError:
+            error_msg = "Chromaprint (fpcalc) não encontrado ou não executável.\n"
+            if fpcalc_path:
+                error_msg += f"Caminho verificado: {fpcalc_path}\n"
+                error_msg += f"Arquivo existe: {Path(fpcalc_path).exists()}\n"
+            error_msg += "Instale: https://acoustid.org/chromaprint\n"
+            error_msg += "Ou certifique-se que fpcalc.exe está em bin/"
+            _LOG.error(error_msg)
+            raise RecognitionError(error_msg)
+        except acoustid.WebServiceError as exc:
+            _LOG.warning(f"AcoustID API error: {exc}")
+            raise RecognitionError(f"Erro na API do AcoustID: {exc}")
+        except Exception as exc:
+            _LOG.error(f"AcoustID unexpected error: {exc}", exc_info=True)
+            raise RecognitionError(f"Erro inesperado no AcoustID: {exc}")
+        finally:
+            # Limpar arquivo temporário
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+    
     def __del__(self) -> None:
         try:
             self._session.close()
@@ -800,23 +687,23 @@ class MultiProviderRecognizer:
     """
     Tries multiple recognition providers in alternating rounds.
 
-    With order acrcloud,audd and attempts_per_provider=2, sequence is:
-    acrcloud#1 -> audd#1 -> acrcloud#2 -> audd#2
+    With order acrcloud,audd,acoustid and attempts_per_provider=1, sequence is:
+    acrcloud#1 -> audd#1 -> acoustid#1
     """
 
     def __init__(
         self,
         audd: AudDRecognizer,
         acrcloud: ACRCloudRecognizer,
-        llm_api: Optional[LLMAPIRecognizer] = None,
-        order: str = "acrcloud,audd",
-        attempts_per_provider: int = 2,
+        acoustid: AcoustIDRecognizer,
+        order: str = "acrcloud,audd,acoustid",
+        attempts_per_provider: int = 1,
     ) -> None:
         self.audd = audd
         self.acrcloud = acrcloud
-        self.llm_api = llm_api
-        self._order = self._parse_order(order, include_llm=self.llm_api is not None)
-        self._attempts_per_provider = max(1, int(attempts_per_provider or 2))
+        self.acoustid = acoustid
+        self._order = self._parse_order(order)
+        self._attempts_per_provider = max(1, int(attempts_per_provider or 1))
         self._fresh_capture_callback = None  # Callback para capturar áudio fresco
         self._suspended_until: dict[str, float] = {}  # {provider_name: timestamp}
         
@@ -824,22 +711,20 @@ class MultiProviderRecognizer:
         self._load_suspensions()
 
     @staticmethod
-    def _parse_order(order: str, include_llm: bool = True) -> list[str]:
-        allowed = {"acrcloud", "audd"}
-        if include_llm:
-            allowed.add("llm_api")
+    def _parse_order(order: str) -> list[str]:
+        allowed = {"acrcloud", "audd", "acoustid"}
         raw = [p.strip().lower() for p in (order or "").split(",") if p.strip()]
         filtered: list[str] = []
         for provider in raw:
             if provider in allowed and provider not in filtered:
                 filtered.append(provider)
         if not filtered:
-            return ["acrcloud", "audd"]
+            return ["acrcloud", "audd", "acoustid"]
         return filtered
 
     def configure_fallback(self, order: str, attempts_per_provider: int) -> None:
-        self._order = self._parse_order(order, include_llm=self.llm_api is not None)
-        self._attempts_per_provider = max(1, int(attempts_per_provider or 2))
+        self._order = self._parse_order(order)
+        self._attempts_per_provider = max(1, int(attempts_per_provider or 1))
 
     def set_fresh_capture_callback(self, callback) -> None:
         """
@@ -972,26 +857,19 @@ class MultiProviderRecognizer:
         acr_access_key: str,
         acr_access_secret: str,
         acr_host: str,
-        llm_base_url: str = "",
-        llm_api_key: str = "",
-        llm_top_k: int = 3,
+        acoustid_api_key: str = "",
     ) -> None:
         self.audd.api_key = (audd_api_key or "").strip()
         self.acrcloud.access_key = (acr_access_key or "").strip()
         self.acrcloud.access_secret = (acr_access_secret or "").strip()
         self.acrcloud.host = (acr_host or "").strip().rstrip("/")
-        if self.llm_api is not None:
-            self.llm_api.base_url = (llm_base_url or "http://127.0.0.1:3000").strip().rstrip("/")
-            self.llm_api.api_key = (llm_api_key or "").strip()
-            self.llm_api.top_k = max(1, int(llm_top_k or 3))
+        self.acoustid.api_key = (acoustid_api_key or "").strip()
 
     def _provider_obj(self, name: str):
         if name == "audd":
             return self.audd
-        if name == "llm_api":
-            if self.llm_api is None:
-                raise RecognitionError("LLM API desabilitada como provedor de reconhecimento.")
-            return self.llm_api
+        if name == "acoustid":
+            return self.acoustid
         return self.acrcloud
 
     def _run_single_attempt(

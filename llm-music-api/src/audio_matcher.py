@@ -151,12 +151,35 @@ class AudioMatcher:
         # Chroma
         chroma = librosa.feature.chroma_stft(y=signal, sr=sr)
 
-        # Estatisticas simples por bloco
-        blocks = [mel_db, mfcc, chroma]
+        # Spectral contrast (captura diferenças de timbre)
+        contrast = librosa.feature.spectral_contrast(y=signal, sr=sr)
+
+        # Tonnetz (representação harmônica mais detalhada)
+        tonnetz = librosa.feature.tonnetz(y=signal, sr=sr)
+
+        # Zero crossing rate (características rítmicas)
+        zcr = librosa.feature.zero_crossing_rate(y=signal)
+
+        # Segmentação temporal: dividir em 8 janelas para capturar evolução temporal
+        n_segments = 8
         feats: List[np.ndarray] = []
-        for block in blocks:
+        
+        for block_name, block in [("mel", mel_db), ("mfcc", mfcc), ("chroma", chroma), 
+                                    ("contrast", contrast), ("tonnetz", tonnetz), ("zcr", zcr)]:
+            n_frames = block.shape[1]
+            segment_size = max(1, n_frames // n_segments)
+            
+            # Estatísticas globais (para compatibilidade)
             feats.append(np.mean(block, axis=1))
             feats.append(np.std(block, axis=1))
+            
+            # Estatísticas por segmento temporal (captura evolução)
+            for i in range(n_segments):
+                start = i * segment_size
+                end = min((i + 1) * segment_size, n_frames)
+                if end > start:
+                    segment = block[:, start:end]
+                    feats.append(np.mean(segment, axis=1))
 
         emb = np.concatenate(feats).astype(np.float32)
         norm = np.linalg.norm(emb)
@@ -282,6 +305,15 @@ class AudioMatcher:
             )
 
         best = matches[0]
+        
+        # Log detalhado para debug de reconhecimento
+        print(f"[audio_matcher] Top {len(matches)} matches:", flush=True)
+        for i, m in enumerate(matches, 1):
+            print(f"  {i}. {m.title} - {m.artist} | sim={m.similarity:.6f} conf={m.confidence:.4f}", flush=True)
+        if len(matches) > 1:
+            sim_diff = matches[0].similarity - matches[1].similarity
+            print(f"[audio_matcher] Diferença 1º-2º: {sim_diff:.6f}", flush=True)
+        
         return {
             "song": best.title,
             "artist": best.artist,

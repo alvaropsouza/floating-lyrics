@@ -173,10 +173,19 @@ class LrcLibFetcher:
         if duration_s > 0:
             params["duration"] = duration_s
 
+        # Log da requisição
+        _LOG.debug(f"🌐 lrclib REQUEST → GET {self.BASE_URL}/get")
+        _LOG.debug(f"   Params: {params}")
+        
         try:
             r = self._session.get(
                 f"{self.BASE_URL}/get", params=params, timeout=self.TIMEOUT
             )
+            
+            # Log da resposta
+            _LOG.debug(f"🌐 lrclib RESPONSE ← Status {r.status_code}")
+            if r.status_code == 200:
+                _LOG.debug(f"   Body: {r.text[:300]}...")
         except requests.RequestException:
             _LOG.warning("lrclib /get falhou", exc_info=True)
             return None
@@ -209,12 +218,20 @@ class LrcLibFetcher:
 
     def _search_with_query(self, query: str, title: str, artist: str, duration_s: int) -> Optional[LyricsResult]:
         """Run one lrclib /search query and rank results."""
+        # Log da requisição
+        _LOG.debug(f"🌐 lrclib REQUEST → GET {self.BASE_URL}/search?q={query}")
+        
         try:
             r = self._session.get(
                 f"{self.BASE_URL}/search",
                 params={"q": query},
                 timeout=self.TIMEOUT,
             )
+            
+            # Log da resposta
+            _LOG.debug(f"🌐 lrclib RESPONSE ← Status {r.status_code}")
+            _LOG.debug(f"   Body: {r.text[:400]}...")
+            
             r.raise_for_status()
             results = _safe_json(r)
         except (requests.RequestException, ValueError):
@@ -320,6 +337,11 @@ class MusixmatchFetcher:
         return self._get_lyrics(track_id)
 
     def _find_track_id(self, title: str, artist: str) -> Optional[int]:
+        # Log da requisição
+        api_key_masked = f"{self.api_key[:8]}..." if len(self.api_key) > 8 else "***"
+        _LOG.debug(f"🌐 Musixmatch REQUEST → GET {self.BASE_URL}/track.search")
+        _LOG.debug(f"   Params: q_track={title}, q_artist={artist}, apikey={api_key_masked}")
+        
         try:
             r = self._session.get(
                 f"{self.BASE_URL}/track.search",
@@ -333,6 +355,11 @@ class MusixmatchFetcher:
                 },
                 timeout=self.TIMEOUT,
             )
+            
+            # Log da resposta
+            _LOG.debug(f"🌐 Musixmatch RESPONSE ← Status {r.status_code}")
+            _LOG.debug(f"   Body: {r.text[:400]}...")
+            
             r.raise_for_status()
             tracks = r.json()["message"]["body"]["track_list"]
         except Exception:
@@ -344,12 +371,22 @@ class MusixmatchFetcher:
         return tracks[0]["track"]["track_id"]
 
     def _get_lyrics(self, track_id: int) -> Optional[LyricsResult]:
+        # Log da requisição
+        api_key_masked = f"{self.api_key[:8]}..." if len(self.api_key) > 8 else "***"
+        _LOG.debug(f"🌐 Musixmatch REQUEST → GET {self.BASE_URL}/track.lyrics.get")
+        _LOG.debug(f"   Params: track_id={track_id}, apikey={api_key_masked}")
+        
         try:
             r = self._session.get(
                 f"{self.BASE_URL}/track.lyrics.get",
                 params={"track_id": track_id, "apikey": self.api_key},
                 timeout=self.TIMEOUT,
             )
+            
+            # Log da resposta
+            _LOG.debug(f"🌐 Musixmatch RESPONSE ← Status {r.status_code}")
+            _LOG.debug(f"   Body: {r.text[:400]}...")
+            
             r.raise_for_status()
             body = r.json()["message"]["body"]["lyrics"]["lyrics_body"]
         except Exception:

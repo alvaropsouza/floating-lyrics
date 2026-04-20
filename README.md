@@ -256,23 +256,35 @@ O executável será gerado em `dist\FloatingLyrics.exe`.
 
 ```
 floating-lyrics/
-├── main.py                  # Ponto de entrada
-├── config.py                # Gerenciador de configuração
-├── config.ini               # Preferências do usuário
-├── requirements.txt
-├── README.md
-└── src/
-    ├── audio_capture.py     # Captura WASAPI loopback via pyaudiowpatch
-    ├── song_recognition.py  # Integração com a API AudD
-    ├── lyrics_fetcher.py    # lrclib.net + Musixmatch (fallback)
-    ├── lyrics_parser.py     # Parser de formato LRC
-    ├── worker_headless.py   # Worker canônico (threading): captura → reconhece → letra
-    ├── worker.py            # Adaptador Qt (signals) sobre o worker_headless
-    ├── websocket_server.py  # Servidor WebSocket (aiohttp)
-    └── websocket_bridge_headless.py # Bridge worker_headless → WebSocket
-    └── ui/
-        ├── main_window.py   # Janela de controle (PyQt6)
-        └── lyrics_window.py # Overlay flutuante (PyQt6, frameless)
+├── main.py                       # Ponto de entrada PyQt6 (standalone)
+├── main_server.py                # Backend Qt com WebSocket
+├── main_server_headless.py       # Backend headless (sem PyQt6)
+├── config.py                     # Gerenciador de configuração
+├── config.ini                    # Preferências do usuário
+├── requirements*.txt             # Dependências Python
+├── start_all.*                   # Scripts para iniciar stack completa
+├── start_server.bat              # Script para iniciar apenas backend
+│
+├── src/                          # Código-fonte principal
+│   ├── audio_capture.py          # Captura WASAPI loopback via pyaudiowpatch
+│   ├── song_recognition.py       # APIs de reconhecimento (AudD, ACRCloud, AcoustID)
+│   ├── lyrics_fetcher.py         # lrclib.net + Musixmatch (fallback)
+│   ├── lyrics_parser.py          # Parser de formato LRC
+│   ├── worker_headless.py        # Worker canônico (threading): captura → reconhece → letra
+│   ├── worker.py                 # Adaptador Qt (signals) sobre o worker_headless
+│   ├── websocket_server.py       # Servidor WebSocket (aiohttp)
+│   ├── websocket_bridge_headless.py # Bridge worker_headless → WebSocket
+│   └── ui/                       # Interface PyQt6 (legado)
+│       ├── main_window.py        # Janela de controle
+│       └── lyrics_window.py      # Overlay flutuante (frameless)
+│
+├── flutter_ui/                   # Frontend Flutter (moderna)
+├── llm-music-api/                # API Node.js para reconhecimento via LLM
+├── cache/                        # Cache de letras e rate limits
+├── logs/                         # Arquivos de log (*.log)
+├── bin/                          # Binários (fpcalc.exe)
+├── docs/                         # Documentação técnica
+└── scripts/                      # Scripts de desenvolvimento e manutenção
 ```
 
 ---

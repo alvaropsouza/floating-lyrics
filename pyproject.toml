@@ -1,0 +1,90 @@
+# Configuração de ferramentas Python para Floating Lyrics
+# Este arquivo configura linting, formatação e type checking
+
+[tool.ruff]
+# Diretórios a incluir na análise
+include = ["*.py", "src/**/*.py", "llm-music-api/src/**/*.py"]
+exclude = [
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "*.egg-info",
+    "build",
+    "dist",
+    "node_modules",
+    "flutter_ui",
+]
+
+# Configurações gerais
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Regras habilitadas:
+# E/W = pycodestyle (erros e warnings)
+# F = pyflakes (erros de código não usado, imports, etc)
+# I = isort (organização de imports)
+# N = pep8-naming (convenções de nomes)
+# UP = pyupgrade (modernização de código Python)
+# B = flake8-bugbear (bugs comuns e anti-patterns)
+# A = flake8-builtins (não sobrescrever builtins)
+# C4 = flake8-comprehensions (list/dict comprehensions)
+# T20 = flake8-print (detectar prints esquecidos - pode desabilitar se precisar)
+# RET = flake8-return (simplificação de returns)
+# SIM = flake8-simplify (simplificações de código)
+# PTH = flake8-use-pathlib (preferir pathlib a os.path)
+select = ["E", "W", "F", "I", "N", "UP", "B", "A", "C4", "RET", "SIM", "PTH"]
+
+# Regras específicas para ignorar (ajuste conforme necessário)
+ignore = [
+    "E501",   # Line too long (já controlado por line-length)
+    "B008",   # Function call in argument defaults (comum em fastapi/typer)
+    "T201",   # Print found (descomente esta linha se quiser permitir prints)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Permitir prints em scripts de teste e utilitários
+"test_*.py" = ["T20"]
+"**/tests/**/*.py" = ["T20"]
+"download_*.py" = ["T20"]
+"validate_*.py" = ["T20"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+
+[tool.mypy]
+# Configuração do mypy para type checking
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false  # Começar permissivo, aumentar gradualmente
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+# Ignorar bibliotecas sem stubs
+[[tool.mypy.overrides]]
+module = [
+    "pyaudiowpatch",
+    "acoustid",
+    "acrcloud.*",
+    "PyQt6.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+# Configuração do pytest
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+]

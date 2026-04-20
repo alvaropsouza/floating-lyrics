@@ -14,8 +14,8 @@ const fastify = require('fastify')({
   bodyLimit: 50 * 1024 * 1024, // Aceita payloads de audio_base64 maiores (evita HTTP 413)
 });
 const cors = require('@fastify/cors');
-const https = require('https');
-const http = require('http');
+const https = require('node:https');
+const http = require('node:http');
 
 // Configurações do ambiente
 const PORT = process.env.PORT || 3000;
@@ -67,7 +67,8 @@ async function callModelServer(prompt) {
       res.on('end', () => {
         try {
           resolve(JSON.parse(data));
-        } catch (e) {
+        } catch (parseErr) {
+          fastify.log.error(`Failed to parse model server response: ${parseErr.message}`);
           reject(new Error(`Failed to parse model server response: ${data}`));
         }
       });
@@ -101,7 +102,8 @@ async function callModelServerTrainIndex(datasetPath) {
       res.on('end', () => {
         try {
           resolve(JSON.parse(data));
-        } catch (e) {
+        } catch (parseErr) {
+          fastify.log.error(`Failed to parse model server train-index response: ${parseErr.message}`);
           reject(new Error(`Failed to parse model server train-index response: ${data}`));
         }
       });
@@ -135,13 +137,17 @@ async function callModelServerIdentifyAudio(audioBase64, topK = 3) {
       res.on('end', () => {
         try {
           resolve(JSON.parse(data));
-        } catch (e) {
+        } catch (parseErr) {
+          fastify.log.error(`Failed to parse model server identify-audio response: ${parseErr.message}`);
           reject(new Error(`Failed to parse model server identify-audio response: ${data}`));
         }
       });
     });
     req.on('error', (err) => {
       reject(new Error(`Cannot connect to model server at ${MODEL_SERVER}. Error: ${err.message}`));
+    });
+    req.setTimeout(35000, () => {
+      req.destroy(new Error('Audio identification timeout (35s)'));
     });
     req.write(body);
     req.end();
@@ -155,9 +161,9 @@ async function callOllama(prompt) {
     stream: false,
     keep_alive: OLLAMA_KEEP_ALIVE,
     options: {
-      temperature: parseFloat(process.env.TEMPERATURE || '0.7'),
-      top_p: parseFloat(process.env.TOP_P || '0.95'),
-      num_predict: parseInt(process.env.MAX_LENGTH || '512'),
+      temperature: Number.parseFloat(process.env.TEMPERATURE || '0.7'),
+      top_p: Number.parseFloat(process.env.TOP_P || '0.95'),
+      num_predict: Number.parseInt(process.env.MAX_LENGTH || '512', 10),
     }
   });
 
@@ -186,11 +192,12 @@ async function callOllama(prompt) {
             const text = parsed.response || '';
             const jsonMatch = text.match(/\{[\s\S]*\}/);
             if (jsonMatch) {
-              try { resolve(JSON.parse(jsonMatch[0])); return; } catch (_) {}
+              try { resolve(JSON.parse(jsonMatch[0])); return; } catch (parseErr) { fastify.log.warn(`JSON parse failed: ${parseErr.message}`); }
             }
             resolve({ song: 'Unknown', artist: 'Unknown', album: '', lyrics: text, confidence: 0.5 });
           }
-        } catch (e) {
+        } catch (parseErr) {
+          fastify.log.error(`Failed to parse Ollama response in callOllama: ${parseErr.message}`);
           reject(new Error(`Failed to parse Ollama response: ${data}`));
         }
       });
@@ -245,11 +252,12 @@ async function callOllamaFast(prompt) {
             const text = parsed.response || '';
             const jsonMatch = text.match(/\{[\s\S]*\}/);
             if (jsonMatch) {
-              try { resolve(JSON.parse(jsonMatch[0])); return; } catch (_) {}
+              try { resolve(JSON.parse(jsonMatch[0])); return; } catch (parseErr) { fastify.log.warn(`JSON parse failed: ${parseErr.message}`); }
             }
             resolve({ song: 'Unknown', artist: 'Unknown', album: '', confidence: 0.5 });
           }
-        } catch (e) {
+        } catch (parseErr) {
+          fastify.log.error(`Failed to parse Ollama response in callOllamaFast: ${parseErr.message}`);
           reject(new Error(`Failed to parse Ollama response: ${data}`));
         }
       });
@@ -278,29 +286,29 @@ async function runModelInference(prompt) {
 function slug(text) {
   return String(text || '')
     .toLowerCase()
-    .replace(/[^a-z0-9\s-_]/g, ' ')
-    .replace(/[\s_]+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-+|-+$/g, '')
+    .replaceAll(/[^a-z0-9\s-_]/g, ' ')
+    .replaceAll(/[\s_]+/g, '-')
+    .replaceAll(/-+/g, '-')
+    .replaceAll(/^-+|-+$/g, '')
     || 'unknown';
 }
 
 function basicCleanTitle(rawTitle) {
   let t = String(rawTitle || '');
   t = t.replace(/^\s*\d{1,2}\s*[-._)]\s*/, '');
-  t = t.replace(/(?:__|_)\d{8}_[a-zA-Z0-9_-]{6,}$/ig, '');
-  t = t.replace(/[_-][A-Za-z0-9_-]{11}$/ig, '');
+  t = t.replaceAll(/(?:__|_)\d{8}_[a-zA-Z0-9-]{6,}$/ig, '');
+  t = t.replaceAll(/[_-][a-zA-Z0-9-]{11}$/ig, '');
   // Remove sufixos artificiais de colisao (_2, -3...), preservando "pt 1".
-  t = t.replace(/(?:[-_ ](?:[2-9]|1\d)){1,3}$/ig, '');
-  t = t.replace(/\[(official|lyrics?|audio|video|hd|4k)[^\]]*\]/ig, '');
-  t = t.replace(/\((official|lyrics?|audio|video|hd|4k)[^\)]*\)/ig, '');
-  t = t.replace(/\b(official\s+video|official\s+audio|lyrics?\s+video|audio\s+only)\b/ig, '');
+  t = t.replaceAll(/(?:[-_ ](?:[2-9]|1\d)){1,3}$/ig, '');
+  t = t.replaceAll(/\[(official|lyrics?|audio|video|hd|4k)[^\]]*\]/ig, '');
+  t = t.replaceAll(/\((official|lyrics?|audio|video|hd|4k)[^)]*\)/ig, '');
+  t = t.replaceAll(/\b(official\s+video|official\s+audio|lyrics?\s+video|audio\s+only)\b/ig, '');
   // Ruido de qualidade / remaster / formato
-  t = t.replace(/\b(remasterizado|remastered|remaster|remixed|deluxe|edition|bonus\s+track)\b/ig, '');
-  t = t.replace(/\b(full\s+album|complete|completo)\b/ig, '');
-  t = t.replace(/\b(hq|hd|4k|1080p|720p|320\s*kbps|flac)\b/ig, '');
-  t = t.replace(/[_-]+/g, ' ');
-  t = t.replace(/\s{2,}/g, ' ').trim();
+  t = t.replaceAll(/\b(remasterizado|remastered|remaster|remixed|deluxe|edition|bonus\s+track)\b/ig, '');
+  t = t.replaceAll(/\b(full\s+album|complete|completo)\b/ig, '');
+  t = t.replaceAll(/\b(hq|hd|4k|1080p|720p|320\s*kbps|flac)\b/ig, '');
+  t = t.replaceAll(/[_-]+/g, ' ');
+  t = t.replaceAll(/\s{2,}/g, ' ').trim();
   return t || 'unknown-title';
 }
 
@@ -360,9 +368,9 @@ function normalizeText(text) {
   return String(text || '')
     .toLowerCase()
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .replace(/\s+/g, ' ')
+    .replaceAll(/[\u0300-\u036f]/g, '')
+    .replaceAll(/[^a-z0-9\s]/g, ' ')
+    .replaceAll(/\s+/g, ' ')
     .trim();
 }
 
@@ -399,7 +407,8 @@ async function searchItunesSongs(term, limit = 20) {
         try {
           const parsed = JSON.parse(data);
           resolve(Array.isArray(parsed.results) ? parsed.results : []);
-        } catch (e) {
+        } catch (parseErr) {
+          fastify.log.error(`Failed to parse iTunes response: ${parseErr.message}`);
           reject(new Error(`Failed to parse iTunes response: ${data.slice(0, 300)}`));
         }
       });
@@ -441,8 +450,7 @@ function buildTitleOnlySearchTerms(rawTitle) {
     if (cleaned.includes(sep)) {
       const parts = cleaned.split(sep).map((part) => part.trim()).filter(Boolean);
       if (parts.length > 1) {
-        terms.push(parts[parts.length - 1]);
-        terms.push(parts[0]);
+        terms.push(parts.at(-1), parts[0]);
       }
     }
   }
@@ -485,7 +493,7 @@ async function buildWebEvidenceFromTitle(rawTitle) {
       const queryScore = jaccardScore(outcome.value.term, title);
       // Bonus: se o artista aparece no título bruto, boost significativo
       const artistInQuery = artist ? jaccardScore(cleanedTitle, artist) : 0;
-      let weightedScore = (titleScore * 0.55) + (queryScore * 0.20) + (artistInQuery * 0.25);
+      let weightedScore = (titleScore * 0.55) + (queryScore * 0.2) + (artistInQuery * 0.25);
 
       // Penalizar covers/karaoke (rebaixar muito no ranking)
       if (coverPatterns.test(title) || coverPatterns.test(artist) || coverPatterns.test(album)) {
@@ -508,9 +516,9 @@ function scoreItunesCandidate(candidate, ctx) {
 
   const weighted =
     (titleScore * 0.55) +
-    (artistScore * 0.20) +
+    (artistScore * 0.2) +
     (albumScore * 0.15) +
-    (llmTitleScore * 0.10);
+    (llmTitleScore * 0.1);
 
   return Math.max(0, Math.min(1, weighted));
 }
@@ -587,7 +595,7 @@ async function resolveMetadataWithCatalog({ rawTitle, uploader = '', albumHint =
         if (candTitle.includes(titleNorm) || titleNorm.includes(candTitle)) {
           s += 0.25;
         }
-        s += jaccardScore(cleanedTitle, c.trackName || '') * 0.20;
+        s += jaccardScore(cleanedTitle, c.trackName || '') * 0.2;
         if (s > fallbackScore) {
           fallbackScore = s;
           fallbackBest = c;
@@ -756,7 +764,8 @@ fastify.get('/health', { logLevel: 'warn' }, async (request, reply) => {
       req.setTimeout(3000, () => { req.destroy(); reject(new Error('timeout')); });
     });
     ollamaStatus = 'connected';
-  } catch (_) {
+  } catch (healthErr) {
+    fastify.log.debug(`Ollama health check failed: ${healthErr.message}`);
     ollamaStatus = 'unavailable';
   }
 
@@ -813,8 +822,8 @@ fastify.post('/identify', async (request, reply) => {
     fastify.log.info(`Inference completed in ${inferenceTime}ms`);
 
     // Verificar confiança mínima (padrão 0.7 = 70%)
-    const minConfidence = parseFloat(process.env.MIN_CONFIDENCE || '0.7');
-    const confidence = result.confidence || 0.0;
+    const minConfidence = Number.parseFloat(process.env.MIN_CONFIDENCE || '0.7');
+    const confidence = result.confidence || 0;
     
     // Se confiança está abaixo do threshold ou model retornou 'Unknown', não confirmar a resposta
     if ((result.song || '').toLowerCase() === 'unknown' || (result.artist || '').toLowerCase() === 'unknown' || confidence < minConfidence) {
@@ -929,7 +938,7 @@ fastify.post('/identify/audio', async (request, reply) => {
         song: result.song || 'Unknown',
         artist: result.artist || 'Unknown',
         album: result.album || '',
-        confidence: result.confidence || 0.0,
+        confidence: result.confidence || 0,
         method: result.method || 'audio_similarity',
         top_matches: result.top_matches || [],
       },
@@ -1056,7 +1065,7 @@ fastify.post('/clean-metadata/batch', async (request, reply) => {
             title: basicCleanTitle(''),
             artist: uploader,
             album: albumHint,
-            confidence: 0.0,
+            confidence: 0,
             source: 'invalid-input',
           },
         };
@@ -1232,11 +1241,14 @@ async function fetchLyricsFromLrclib(title, artist) {
           source: 'lrclib',
         };
       }
-    } catch (_) { /* ignore, try next */ }
+    } catch (lrclibErr) { 
+      fastify.log.debug(`lrclib get failed: ${lrclibErr.message}`); 
+    }
   }
 
   // Fallback: pesquisa livre
-  const searchUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(`${artist} ${title}`)}`;
+  const searchQuery = `${artist} ${title}`;
+  const searchUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(searchQuery)}`;
   try {
     const results = await httpGetJson(searchUrl, 5000);
     if (Array.isArray(results) && results.length > 0) {
@@ -1260,7 +1272,9 @@ async function fetchLyricsFromLrclib(title, artist) {
         };
       }
     }
-  } catch (_) { /* ignore */ }
+  } catch (searchErr) { 
+    fastify.log.debug(`lrclib search failed: ${searchErr.message}`); 
+  }
 
   return null;
 }

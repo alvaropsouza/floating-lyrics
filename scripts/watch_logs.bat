@@ -9,8 +9,8 @@ echo Aguarde...checando se servidor esta rodando...
 echo.
 
 REM Verificar se o arquivo de log existe
-if not exist "server.log" (
-    echo [AVISO] Arquivo server.log nao encontrado!
+if not exist "..\logs\server.log" (
+    echo [AVISO] Arquivo logs\server.log nao encontrado!
     echo.
     echo O servidor pode nao estar rodando ainda.
     echo Inicie o servidor com start_server.bat primeiro.
@@ -25,4 +25,4 @@ echo ========================================
 echo.
 
 REM Mostrar últimas 50 linhas e seguir novas entradas
-powershell -Command "Get-Content server.log -Tail 50 -Wait"
+powershell -Command "Get-Content ..\logs\server.log -Tail 50 -Wait"

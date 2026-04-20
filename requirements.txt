@@ -15,6 +15,10 @@ pyaudiowpatch>=0.2.12.6
 # HTTP client for AudD, lrclib.net, Musixmatch
 requests>=2.31.0
 
+# AcoustID: Audio fingerprinting via Chromaprint + MusicBrainz  
+# Free, unlimited API (requires free API key from https://acoustid.org/)
+pyacoustid>=1.3.0
+
 # WebSocket server para comunicação com Flutter frontend
 aiohttp>=3.9.0
 

@@ -41,7 +41,7 @@ logging.basicConfig(
             show_path=False,
             markup=True,
         ),
-        logging.FileHandler(Path(__file__).parent / "server.log", encoding="utf-8"),
+        logging.FileHandler(Path(__file__).parent / "logs" / "server.log", encoding="utf-8"),
     ]
 )
 # Silenciar módulos muito verbosos
@@ -56,10 +56,8 @@ from src.audio_capture import AudioCapture
 from src.lyrics_fetcher import LyricsFetcher
 from src.song_recognition import (
     ACRCloudRecognizer,
+    AcoustIDRecognizer,
     AudDRecognizer,
-    LLMAPIRecognizer,
-    LLMAPITrainer,
-    LLMSearchClient,
     MultiProviderRecognizer,
 )
 from src.websocket_bridge_headless import WebSocketBridgeHeadless
@@ -118,36 +116,19 @@ class HeadlessBackendServer:
             access_secret=self.config.get("ACRCloud", "access_secret", fallback=""),
             host=self.config.get("ACRCloud", "host", fallback="identify-eu-west-1.acrcloud.com"),
         )
-        use_llm_for_recognition = self.config.getboolean(
-            "Recognition",
-            "use_llm_for_recognition",
-            fallback=False,
+        acoustid = AcoustIDRecognizer(
+            api_key=self.config.get("API", "acoustid_api_key", fallback=""),
         )
-        llm_api = None
-        if use_llm_for_recognition:
-            llm_api = LLMAPIRecognizer(
-                base_url=self.config.get("LLMApi", "base_url", fallback="http://127.0.0.1:3000"),
-                api_key=self.config.get("API", "llm_api_key", fallback=""),
-                top_k=self.config.getint("LLMApi", "top_k", fallback=3),
-            )
-        llm_trainer = LLMAPITrainer(
-            base_url=self.config.get("LLMApi", "base_url", fallback="http://127.0.0.1:3000"),
-            api_key=self.config.get("API", "llm_api_key", fallback=""),
-        )
+        
         recognizer = MultiProviderRecognizer(
             audd=audd,
             acrcloud=acr,
-            llm_api=llm_api,
-            order=self.config.get("Recognition", "provider_fallback_order", fallback="acrcloud,audd"),
-            attempts_per_provider=self.config.getint("Recognition", "provider_attempts", fallback=2),
+            acoustid=acoustid,
+            order=self.config.get("Recognition", "provider_fallback_order", fallback="acrcloud,audd,acoustid"),
+            attempts_per_provider=self.config.getint("Recognition", "provider_attempts", fallback=1),
         )
         
         lyrics = LyricsFetcher(self.config)
-        
-        # Cliente /search (busca web + LLM → metadados + letras)
-        llm_search = LLMSearchClient(
-            base_url=self.config.get("LLMApi", "base_url", fallback="http://127.0.0.1:3000"),
-        )
 
         # Criar worker headless
         self.worker = RecognitionWorkerHeadless(
@@ -155,8 +136,6 @@ class HeadlessBackendServer:
             audio,
             recognizer,
             lyrics,
-            llm_trainer=llm_trainer,
-            llm_search=llm_search,
         )
         
         _LOG.info("Worker headless configurado com sucesso")
@@ -207,6 +186,22 @@ class HeadlessBackendServer:
         self.loop = asyncio.get_running_loop()
         self.bridge = WebSocketBridgeHeadless(self.worker, self.loop, self.config)
         
+        # Configurar shutdown handler com asyncio (funciona melhor no Windows)
+        shutdown_event = asyncio.Event()
+        
+        def request_shutdown():
+            _LOG.info("\n🛑 Interrupção detectada (Ctrl+C)")
+            shutdown_event.set()
+        
+        # Registrar signal handlers no event loop (não usa signal.signal diretamente)
+        try:
+            self.loop.add_signal_handler(signal.SIGINT, request_shutdown)
+            self.loop.add_signal_handler(signal.SIGTERM, request_shutdown)
+        except NotImplementedError:
+            # Windows não suporta add_signal_handler, então vamos usar outra abordagem
+            # Vamos capturar KeyboardInterrupt no nível do asyncio.run()
+            pass
+        
         # Iniciar worker em thread separada
         _LOG.info("Iniciando reconhecimento de música...")
         self.worker.start()
@@ -223,13 +218,9 @@ class HeadlessBackendServer:
         _LOG.info("Pressione Ctrl+C para parar")
         _LOG.info("")
         
-        # Aguardar indefinidamente (até receber SIGINT/SIGTERM)
-        try:
-            await asyncio.Event().wait()  # Espera eterna
-        except asyncio.CancelledError:
-            _LOG.info("\nShutdown solicitado...")
-            await self.shutdown()
-            return
+        # Aguardar até shutdown ser solicitado
+        await shutdown_event.wait()
+        await self.shutdown()
 
     async def shutdown(self) -> None:
         """Shutdown gracioso."""
@@ -239,38 +230,48 @@ class HeadlessBackendServer:
         _LOG.info("Parando servidor...")
         self._shutdown = True
         
-        # Parar worker
+        # Parar worker com timeout reduzido (3s é suficiente para interromper captura)
         if self.worker:
             _LOG.info("Parando worker...")
             self.worker.stop()
-            self.worker.join(timeout=2)
+            # Aguardar até 3 segundos (captura de áudio agora pode ser interrompida)
+            self.worker.join(timeout=3)
+            if self.worker.is_alive():
+                _LOG.warning("⚠️  Worker não parou a tempo")
+                _LOG.info("   Forçando encerramento do processo...")
+                # Não aguardar mais - o processo terminará de qualquer forma
         
-        # Parar WebSocket server
+        # Parar WebSocket server (com timeout)
         _LOG.info("Parando WebSocket server...")
-        await self.ws_server.stop()
+        try:
+            await asyncio.wait_for(self.ws_server.stop(), timeout=2.0)
+        except asyncio.TimeoutError:
+            _LOG.warning("WebSocket server não parou a tempo")
         
-        _LOG.info("Servidor parado com sucesso")
+        _LOG.info("✓ Servidor parado")
 
     def run(self) -> int:
         """Entry point principal."""
-        # Configurar signal handlers
-        def signal_handler(sig, frame):
-            _LOG.info(f"\nRecebido sinal {sig}")
-            if self.loop:
-                # Cancelar todas as tasks
-                for task in asyncio.all_tasks(self.loop):
-                    task.cancel()
-        
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        
         # Rodar servidor
         try:
             asyncio.run(self.run_server())
-        except asyncio.CancelledError:
-            _LOG.info("Servidor encerrado.")
         except KeyboardInterrupt:
-            _LOG.info("\nInterrompido pelo usuário")
+            # No Windows, asyncio.run() captura KeyboardInterrupt
+            # Precisamos garantir que shutdown() seja chamado
+            _LOG.info("\n🛑 Interrompido pelo usuário (Ctrl+C)")
+            
+            # Forçar cleanup síncrono com timeout reduzido
+            if self.worker and self.worker.is_alive():
+                _LOG.info("Parando worker...")
+                self.worker.stop()
+                self.worker.join(timeout=3)
+                if self.worker.is_alive():
+                    _LOG.warning("⚠️  Worker não parou a tempo")
+                    _LOG.info("   Forçando encerramento do processo...")
+                    # Não aguardar mais
+                    
+            _LOG.info("✓ Servidor parado")
+            return 0
         except RuntimeError as exc:
             # Erros de configuração (porta em uso, etc)
             _LOG.error(f"\n❌ Erro: {exc}")

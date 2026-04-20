@@ -14,16 +14,19 @@ import re
 import json
 import sys
 import threading
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import torch
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, GenerationConfig
 from audio_matcher import AudioMatcher
 
-MODEL_PATH = os.environ.get(
+# Normalizar MODEL_PATH para evitar problemas com caminhos Windows
+_model_path_raw = os.environ.get(
     "MODEL_PATH",
     os.path.join(os.path.dirname(__file__), "..", "models", "mistral-7b-music-lora")
 )
+MODEL_PATH = str(Path(_model_path_raw).resolve()) if os.path.exists(_model_path_raw) else _model_path_raw
 PORT = int(os.environ.get("MODEL_SERVER_PORT", "8000"))
 MAX_LENGTH = int(os.environ.get("MAX_LENGTH", "512"))
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.7"))
@@ -65,8 +68,17 @@ def normalize_rope_scaling(model_config):
         model_config.rope_scaling = None
 
 
-config = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
-normalize_rope_scaling(config)
+# Carrega config somente se geracao estiver habilitada
+config = None
+if MODEL_ENABLE_GENERATION:
+    # Validar que o modelo existe localmente
+    if not Path(MODEL_PATH).exists():
+        print(f"[model_server] ERRO: Modelo não encontrado em {MODEL_PATH}", flush=True)
+        print(f"[model_server] Configure MODEL_PATH ou baixe um modelo local", flush=True)
+        sys.exit(1)
+    
+    config = AutoConfig.from_pretrained(MODEL_PATH, trust_remote_code=True)
+    normalize_rope_scaling(config)
 
 tokenizer = None
 model = None

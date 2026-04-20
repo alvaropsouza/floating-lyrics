@@ -29,9 +29,6 @@ echo [*] Flutter encontrado:
 flutter --version | findstr "Flutter"
 echo.
 
-REM Ir para pasta Flutter
-cd flutter_ui
-
 REM Verificar se pubspec.yaml existe
 if not exist pubspec.yaml (
     echo [!] Arquivo pubspec.yaml nao encontrado

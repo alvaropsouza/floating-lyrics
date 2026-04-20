@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
 from typing import Callable, Any
 
-from src.song_recognition import LLMAPITrainer, LLMSearchClient, RateLimitError
+from src.song_recognition import RateLimitError
 
 
 _LOG = logging.getLogger(__name__)
@@ -32,14 +32,12 @@ class RecognitionWorkerHeadless(threading.Thread):
       4. Chama callbacks para notificar eventos
     """
 
-    def __init__(self, config, audio_capture, recognizer, lyrics_fetcher, llm_trainer: LLMAPITrainer | None = None, llm_search: LLMSearchClient | None = None):
+    def __init__(self, config, audio_capture, recognizer, lyrics_fetcher):
         super().__init__(daemon=True, name="RecognitionWorker")
         self._config = config
         self._audio = audio_capture
         self._recognizer = recognizer
         self._lyrics = lyrics_fetcher
-        self._llm_trainer = llm_trainer
-        self._llm_search = llm_search
         self._stop_flag = threading.Event()
         self._current_song_key: tuple[str, str, str] | None = None
         self._miss_streak: int = 0
@@ -48,6 +46,9 @@ class RecognitionWorkerHeadless(threading.Thread):
         self._rate_limit_cooldown_s: float = 30 * 60  # 30 minutes
         self._last_recognition_time: float = 0.0
         self._current_song_duration_s: float = 0.0
+
+        # Conectar flag de stop ao AudioCapture para interromper capturas em andamento
+        self._audio.set_shutdown_flag(self._stop_flag)
 
         self._miss_reset_threshold = max(
             1,
@@ -74,12 +75,6 @@ class RecognitionWorkerHeadless(threading.Thread):
         # ThreadPool para busca de letras não bloqueante
         self._lyrics_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LyricsFetch")
         self._pending_lyrics_future: Future | None = None
-
-        # ThreadPool para treino assíncrono do índice de áudio da LLM API
-        self._training_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LLMTrain")
-        self._pending_training_future: Future | None = None
-        self._training_requested = False
-        self._last_training_request_at = 0.0
 
         # Detector local de troca de musica (evita chamadas as APIs durante tracking)
         self._disable_api_recognition_while_tracking = self._config.getboolean(
@@ -125,7 +120,6 @@ class RecognitionWorkerHeadless(threading.Thread):
         # Rastreamento de mudanças rápidas
         self._min_recognition_interval_s = self._config.getfloat("Recognition", "confidence_interval", fallback=2.0)
         self._last_full_recognition_time: float = 0.0
-        self._last_training_save_by_song: dict[tuple[str, str, str], float] = {}
         self._new_song_attempts: int = 0
         self._new_song_cooldown_until: float = 0.0
         
@@ -143,95 +137,6 @@ class RecognitionWorkerHeadless(threading.Thread):
         normalized = re.sub(r"[^a-z0-9._-]", "", normalized)
         normalized = normalized.strip("-._")
         return normalized or fallback
-
-    def _request_llm_training(self) -> None:
-        if self._llm_trainer is None:
-            return
-        if not self._config.getboolean("Recognition", "auto_train_llm_on_new_audio", fallback=True):
-            return
-
-        self._training_requested = True
-        self._start_llm_training_if_idle()
-
-    def _start_llm_training_if_idle(self) -> None:
-        if self._llm_trainer is None or not self._training_requested:
-            return
-        if self._pending_training_future and not self._pending_training_future.done():
-            return
-
-        debounce_s = max(
-            0,
-            self._config.getint("Recognition", "llm_train_debounce_s", fallback=15),
-        )
-        delay_s = max(0.0, debounce_s - (time.monotonic() - self._last_training_request_at))
-        self._training_requested = False
-        self._last_training_request_at = time.monotonic() + delay_s
-        self._pending_training_future = self._training_executor.submit(self._run_llm_training, delay_s)
-        self._pending_training_future.add_done_callback(self._on_llm_training_done)
-
-    def _run_llm_training(self, delay_s: float = 0.0) -> dict[str, Any]:
-        if delay_s > 0:
-            time.sleep(delay_s)
-        _LOG.info("🧠 Disparando treino automático do índice de áudio da LLM API...")
-        return self._llm_trainer.trigger_training()
-
-    def _on_llm_training_done(self, future: Future) -> None:
-        try:
-            result = future.result()
-            items = result.get("items") if isinstance(result, dict) else None
-            skipped = result.get("skipped") if isinstance(result, dict) else None
-            if items is not None:
-                _LOG.info(
-                    "✅ Treino automático concluído na LLM API (itens=%s, ignorados=%s).",
-                    items,
-                    skipped if skipped is not None else 0,
-                )
-            else:
-                _LOG.info("✅ Treino automático concluído na LLM API.")
-        except Exception as exc:
-            _LOG.warning("Falha ao treinar automaticamente a LLM API: %s", exc)
-        finally:
-            if self._training_requested and not self._stop_flag.is_set():
-                self._start_llm_training_if_idle()
-
-    def _save_training_audio_if_needed(self, result, song_key: tuple[str, str, str], audio_bytes: bytes) -> None:
-        if not self._config.getboolean("Recognition", "save_audio_for_training", fallback=True):
-            return
-
-        cooldown_s = max(
-            0,
-            self._config.getint("Recognition", "training_audio_same_song_cooldown_s", fallback=90),
-        )
-        now = time.time()
-        last = self._last_training_save_by_song.get(song_key, 0.0)
-        if cooldown_s > 0 and (now - last) < cooldown_s:
-            return
-
-        artist = self._sanitize_part(result.artist, "unknown-artist")
-        title = self._sanitize_part(result.title, "unknown-title")
-        album = self._sanitize_part(result.album or "", "unknown-album")
-        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
-        
-        # Organizar em forma: training_audio/{artist}/{album}/{title}__{timestamp}.wav
-        filename = f"{title}__{stamp}.wav"
-
-        target_dir = (
-            Path(__file__).resolve().parent.parent
-            / "llm-music-api"
-            / "training_audio"
-            / artist
-            / album
-        )
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = target_dir / filename
-
-        try:
-            target_path.write_bytes(audio_bytes)
-            self._last_training_save_by_song[song_key] = now
-            _LOG.info("🎓 Trecho salvo para treino: %s", target_path.relative_to(target_dir.parent.parent.parent))
-            self._request_llm_training()
-        except Exception as exc:
-            _LOG.warning("Falha ao salvar trecho para treino: %s", exc)
 
     # ── Event callbacks ─────────────────────────────────────────────────────
 
@@ -259,7 +164,6 @@ class RecognitionWorkerHeadless(threading.Thread):
         if self._pending_lyrics_future and not self._pending_lyrics_future.done():
             self._pending_lyrics_future.cancel()
         self._lyrics_executor.shutdown(wait=False, cancel_futures=True)
-        self._training_executor.shutdown(wait=False, cancel_futures=True)
 
     def join(self, timeout=None) -> None:
         """Aguarda a thread terminar."""
@@ -283,13 +187,18 @@ class RecognitionWorkerHeadless(threading.Thread):
         self._spectrum_thread.start()
         
         while not self._stop_flag.is_set():
-            self._cycle()
+            try:
+                self._cycle()
+            except Exception as exc:
+                _LOG.error(f"Erro no ciclo de reconhecimento: {exc}", exc_info=True)
+            
             if self._stop_flag.is_set():
                 break
             self._wait_interval()
         
         # Parar thread de espectro
         self._spectrum_running = False
+        _LOG.debug("Worker: loop principal encerrado")
         _LOG.info("Worker headless parado")
 
     def _spectrum_loop(self) -> None:
@@ -299,7 +208,7 @@ class RecognitionWorkerHeadless(threading.Thread):
         max_errors = 10
         first_call = True
         
-        while self._spectrum_running:
+        while self._spectrum_running and not self._stop_flag.is_set():
             try:
                 if first_call:
                     _LOG.info("Iniciando primeira captura de espectro...")
@@ -320,6 +229,10 @@ class RecognitionWorkerHeadless(threading.Thread):
                 elif error_count == max_errors:
                     _LOG.error("Muitos erros consecutivos ao capturar espectro. Parando thread.")
                     break
+            
+            # Verificar stop flag antes de dormir
+            if self._stop_flag.is_set():
+                break
             
             # Atualizar ~20 vezes por segundo (50ms de sleep)
             time.sleep(0.05)
@@ -510,17 +423,28 @@ class RecognitionWorkerHeadless(threading.Thread):
         # Emit status
         self._emit('status_changed', "🎵 Capturando áudio...")
 
-        # Capture audio
+        # Capture audio (pode demorar vários segundos - operação bloqueante)
         try:
             capture_start = time.perf_counter()
             duration = self._capture_duration_for_cycle()
+            _LOG.debug(f"Worker: iniciando captura de {duration}s de áudio...")
             audio_data = self._audio.capture(duration)
+            _LOG.debug(f"Worker: captura concluída ({len(audio_data) if audio_data else 0} bytes)")
             if audio_data is None or len(audio_data) == 0:
                 _LOG.debug("No audio captured")
                 return
         except Exception as exc:
+            # Se foi interrompido por shutdown, não logar como erro
+            if "shutdown" in str(exc).lower() or self._stop_flag.is_set():
+                _LOG.debug(f"Captura de áudio interrompida: {exc}")
+                return
             _LOG.error(f"Erro ao capturar áudio: {exc}", exc_info=True)
             self._emit('error_occurred', f"Erro ao capturar áudio: {exc}")
+            return
+
+        # Checar se foi solicitado stop durante a captura
+        if self._stop_flag.is_set():
+            _LOG.debug("Worker: stop solicitado após captura de áudio")
             return
 
         # Skip recognition if in tracking mode and not needed
@@ -528,13 +452,14 @@ class RecognitionWorkerHeadless(threading.Thread):
             _LOG.debug("Skipping recognition (tracking mode)")
             return
 
-        # Recognize
+        # Recognize (pode demorar vários segundos - HTTP request bloqueante)
         self._emit('status_changed', "🔍 Reconhecendo música...")
         try:
+            _LOG.debug("Worker: iniciando reconhecimento...")
             result, updated_capture_start = self._recognizer.recognize(audio_data, capture_start)
             elapsed = time.perf_counter() - start_time
             found = result is not None
-            _LOG.debug(f"{elapsed:.1f}s | encontrado={found}")
+            _LOG.debug(f"Worker: reconhecimento concluído em {elapsed:.1f}s | encontrado={found}")
             
             if found and result:
                 self._handle_song_found(result, updated_capture_start, audio_data)
@@ -626,8 +551,6 @@ class RecognitionWorkerHeadless(threading.Thread):
         # Verificar se confiança indica mudança de música
         if self._check_confidence_for_song_change(result):
             return  # Ignorar este reconhecimento
-
-        self._save_training_audio_if_needed(result, song_key, audio_bytes)
         
         # Emit song found
         self._emit('song_found', result.title, result.artist, result.album or "")
@@ -724,21 +647,7 @@ class RecognitionWorkerHeadless(threading.Thread):
             artist = result.artist
             album = result.album
 
-            # ── Enriquecer metadados via /search (LLM) ───────────────────
-            if self._llm_search is not None:
-                raw_title = f"{artist} - {title}" if artist else title
-                _LOG.info("🔍 Enriquecendo metadados via /search: '%s'", raw_title[:120])
-                search_data = self._llm_search.search(raw_title)
-                if search_data:
-                    title = search_data.get("title") or title
-                    artist = search_data.get("artist") or artist
-                    album = search_data.get("album") or album
-                    _LOG.info(
-                        "✅ /search: artist=%s, title=%s, album=%s",
-                        artist, title, album,
-                    )
-
-            # ── Buscar letras via lrclib com dados (possivelmente corrigidos)
+            # ── Buscar letras via lrclib com dados originais do reconhecimento
             _LOG.info("🔍 Buscando letras via lrclib: title='%s' artist='%s'", title, artist)
             lyrics_result = self._lyrics.fetch(
                 title=title,

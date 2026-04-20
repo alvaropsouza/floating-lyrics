@@ -1,0 +1,45 @@
+# Pre-commit hooks para Floating Lyrics
+# Executa validações automáticas antes de cada commit
+#
+# Instalação:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Uso manual:
+#   pre-commit run --all-files
+
+repos:
+  # Ruff - Linter e formatter Python super rápido
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.3.0
+    hooks:
+      # Linting
+      - id: ruff
+        args: [--fix]
+        types_or: [python, pyi]
+      # Formatação
+      - id: ruff-format
+        types_or: [python, pyi]
+
+  # Hooks gerais úteis
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-yaml
+        exclude: ^flutter_ui/
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=5000]
+      - id: check-merge-conflict
+      - id: detect-private-key
+
+  # MyPy - Type checking (opcional, comentado por padrão)
+  # - repo: https://github.com/pre-commit/mirrors-mypy
+  #   rev: v1.8.0
+  #   hooks:
+  #     - id: mypy
+  #       additional_dependencies: [types-requests]
+  #       args: [--ignore-missing-imports]

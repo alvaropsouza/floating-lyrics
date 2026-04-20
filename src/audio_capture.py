@@ -54,8 +54,13 @@ class AudioCapture:
         self._capture_active = threading.Event()   # evita contencao do loopback durante capture()
         self._last_spectrum: list[float] = [0.0] * 32  # Cache do último espectro
         self._spectrum_cache_hits = 0  # Contador de cache hits consecutivos
+        self._shutdown_flag: Optional[threading.Event] = None  # Flag para interromper captura
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
+
+    def set_shutdown_flag(self, flag: threading.Event) -> None:
+        """Define a flag de shutdown que será verificada durante a captura."""
+        self._shutdown_flag = flag
 
     def initialize(self) -> None:
         """
@@ -487,11 +492,22 @@ class AudioCapture:
         channels: int = min(int(device["maxInputChannels"]), 2) or 1
         frames: list[bytes] = []
 
+        # Buffer size configurável via config.ini (padrão: 0.1s = ~100ms de latência)
+        # Buffers maiores = menos pipocos, mas maior latência
+        buffer_duration_ms = self._config.getfloat("Audio", "buffer_duration_ms", fallback=100.0)
+        preferred_chunk = int(sample_rate * (buffer_duration_ms / 1000.0))
+        
         # Let the WASAPI driver pick the optimal buffer size first (0 = unspecified).
         # Fall back to explicit sizes if the driver rejects paFramesPerBufferUnspecified.
-        chunk_candidates = [0, 512, 1024, 2048, 4096]
+        # Ordem: auto (0) > configurado > tamanhos crescentes (evitar buffers muito pequenos)
+        chunk_candidates = [0, preferred_chunk, 2048, 4096, 8192, 16384]
+        # Remover duplicatas e valores inválidos
+        chunk_candidates = sorted(set(c for c in chunk_candidates if c == 0 or c >= 512))
+        
         stream = None
         last_exc: Exception | None = None
+        used_chunk = 0
+        
         for chunk in chunk_candidates:
             try:
                 stream = self._pa.open(
@@ -502,6 +518,9 @@ class AudioCapture:
                     input_device_index=int(device["index"]),
                     frames_per_buffer=chunk,
                 )
+                used_chunk = chunk
+                _LOG.debug("Stream WASAPI aberto com chunk=%d (%.1fms buffer)", 
+                          chunk, (chunk / sample_rate * 1000.0) if chunk > 0 else 0.0)
                 break
             except OSError as exc:
                 _LOG.debug("Falha ao abrir stream com chunk=%d: %s", chunk, exc)
@@ -521,18 +540,42 @@ class AudioCapture:
                 "Tente trocar o dispositivo de saída de áudio ou reiniciar o aplicativo."
             )
 
-        # Use a fixed read chunk of 1024 for the read loop regardless of the
-        # buffer size used to open the stream.
-        read_chunk = 1024 if chunk == 0 else chunk
+        # Use chunk adaptativo: se driver escolheu (chunk=0), usar 2048; senão usar o chunk negociado
+        read_chunk = 2048 if used_chunk == 0 else used_chunk
         capture_started_at = 0.0
         capture_elapsed_s = 0.0
+        overflow_count = 0
+        
         try:
             total_chunks = max(1, round((sample_rate / read_chunk) * duration))
             capture_started_at = time.perf_counter()
-            for _ in range(total_chunks):
-                data = stream.read(read_chunk, exception_on_overflow=False)
-                frames.append(data)
+            
+            for chunk_idx in range(total_chunks):
+                # Verificar se foi solicitado shutdown antes de cada chunk
+                if self._shutdown_flag and self._shutdown_flag.is_set():
+                    _LOG.debug("Captura de áudio interrompida por shutdown (chunk %d/%d)", chunk_idx, total_chunks)
+                    raise AudioCaptureError("Captura interrompida por shutdown")
+                
+                try:
+                    # Leitura não-bloqueante com detecção de overflow
+                    data = stream.read(read_chunk, exception_on_overflow=False)
+                    frames.append(data)
+                except OSError as read_exc:
+                    # Overflow detectado: logar mas continuar (áudio já tem gaps)
+                    overflow_count += 1
+                    _LOG.debug("Buffer overflow no chunk %d/%d: %s", chunk_idx, total_chunks, read_exc)
+                    # Adicionar silêncio para manter sincronismo temporal
+                    frames.append(b'\x00\x00' * read_chunk * channels)
+                    
             capture_elapsed_s = max(0.001, time.perf_counter() - capture_started_at)
+            
+            if overflow_count > 0:
+                _LOG.warning(
+                    "Detectados %d buffer overflows durante captura (%.1f%% dos chunks). "
+                    "Aumente buffer_duration_ms no config.ini para reduzir pipocos.",
+                    overflow_count,
+                    (overflow_count / total_chunks * 100.0)
+                )
         except OSError as exc:
             raise AudioCaptureError(f"Erro durante a gravação: {exc}") from exc
         finally:

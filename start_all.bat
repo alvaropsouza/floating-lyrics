@@ -6,8 +6,10 @@ setlocal
 cd /d "%~dp0"
 
 set "NO_FRONT=0"
-if /I "%~1"=="--no-front" set "NO_FRONT=1"
-if /I "%~1"=="--no-frontend" set "NO_FRONT=1"
+for %%a in (%*) do (
+    if /I "%%a"=="--no-front" set "NO_FRONT=1"
+    if /I "%%a"=="--no-frontend" set "NO_FRONT=1"
+)
 
 echo.
 echo ============================================================
@@ -15,22 +17,25 @@ echo   Floating Lyrics - Full Dev Stack
 echo ============================================================
 echo.
 
-echo [*] Iniciando llm-music-api em modo dev...
-start "LLM Music API" cmd /k "cd /d \"%~dp0llm-music-api\" && call start-dev.bat"
+REM echo [*] Iniciando llm-music-api localmente (sem Docker)...
+REM start "LLM Music API" cmd /k "cd /d "%~dp0llm-music-api" && start-local.bat"
 
 echo [*] Iniciando backend Python headless...
-start "Floating Lyrics Backend" cmd /k "cd /d \"%~dp0\" && call start_server.bat"
+start "Floating Lyrics Backend" cmd /k "cd /d "%~dp0" && start_server.bat"
 
 if "%NO_FRONT%"=="1" (
 	echo [*] Modo sem frontend habilitado (--no-front).
 ) else (
 	echo [*] Iniciando Flutter UI...
-	start "Floating Lyrics Flutter" cmd /k "cd /d \"%~dp0\" && call flutter_ui\run_flutter.bat"
+	start "Floating Lyrics Flutter" cmd /k "cd /d "%~dp0flutter_ui" && run_flutter.bat"
 )
 
 echo.
 echo [OK] Stack iniciada em janelas separadas.
-echo [i] Se for o primeiro boot do llm-music-api, o Docker ainda pode levar alguns minutos.
+REM echo [i] A API Node.js roda localmente na porta 3000, model-server na porta 8000.
+echo [i] Backend headless rodando na porta 8765 (WebSocket)
+echo [i] Flags disponiveis:
+echo     --no-front   : Inicia sem Flutter UI
 echo.
 
 endlocal

@@ -130,16 +130,21 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
     return Center(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, size: 64, color: Colors.white24),
-          const SizedBox(height: 16),
-          Text(
-            message,
-            style: const TextStyle(
-              color: Colors.white54,
-              fontSize: 14,
+          Icon(icon, size: 48, color: Colors.white24),
+          const SizedBox(height: 12),
+          Flexible(
+            child: Text(
+              message,
+              style: const TextStyle(
+                color: Colors.white54,
+                fontSize: 14,
+              ),
+              textAlign: TextAlign.center,
+              overflow: TextOverflow.ellipsis,
+              maxLines: 2,
             ),
-            textAlign: TextAlign.center,
           ),
         ],
       ),

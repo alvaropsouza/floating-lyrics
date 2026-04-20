@@ -45,8 +45,8 @@ if not errorlevel 1 (
     echo [!] ATENCAO: Porta 8765 ja esta em uso!
     echo [!] Provavelmente ha um servidor rodando.
     echo.
-    echo [?] Deseja parar processos Python existentes? (S/N^)
-    set /p kill_choice=
+    echo [?] Deseja parar processos Python existentes? (S/N)
+    set /p "kill_choice="
     if /i "%kill_choice%"=="S" (
         echo [*] Parando processos Python...
         taskkill /F /IM python.exe >nul 2>&1
