@@ -25,6 +25,16 @@ import requests
 _LOG = logging.getLogger(__name__)
 _CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "lyrics"
 _ARTIST_SPLIT_RE = re.compile(r'[,&/]')  # separadores de artistas compostos
+# Marcadores de seção de letra: [Chorus], [Verse 1], [Bridge], etc.
+# Linha inteira entre colchetes, sem timestamp numérico (que seria [mm:ss.cc]).
+_SECTION_MARKER_RE = re.compile(r'^\[(?!\d+:)[^\]]+\]$')
+_LRC_TIMESTAMP_RE = re.compile(r'\[\d{1,3}:\d{2}\.\d{2,3}\]')
+
+
+def _is_lrc_section_marker(line: str) -> bool:
+    """Retorna True se a linha LRC, após remover timestamps, for apenas um marcador de seção."""
+    text = _LRC_TIMESTAMP_RE.sub('', line).strip()
+    return bool(_SECTION_MARKER_RE.match(text))
 
 
 @dataclass
@@ -384,12 +394,14 @@ class LrcLibFetcher:
     def _parse_response(data: dict) -> Optional[LyricsResult]:
         if data.get("syncedLyrics"):
             lrc = data["syncedLyrics"]
-            return LyricsResult(
-                lines=lrc.splitlines(), synced=True, raw_lrc=lrc
-            )
+            # Remover linhas que são apenas marcadores de seção ([Chorus], [Verse 1], etc.)
+            clean_lines = [ln for ln in lrc.splitlines() if not _is_lrc_section_marker(ln)]
+            clean_lrc = "\n".join(clean_lines)
+            return LyricsResult(lines=clean_lines, synced=True, raw_lrc=clean_lrc)
         if data.get("plainLyrics"):
             txt = data["plainLyrics"]
-            return LyricsResult(lines=txt.splitlines(), synced=False)
+            lines = [ln for ln in txt.splitlines() if not _SECTION_MARKER_RE.match(ln.strip())]
+            return LyricsResult(lines=lines, synced=False)
         return None
 
     def __del__(self) -> None:
