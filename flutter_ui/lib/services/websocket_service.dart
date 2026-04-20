@@ -139,7 +139,8 @@ class WebSocketService extends ChangeNotifier {
           final content = payload?['lyrics'] as String? ?? '';
           final synced = payload?['synced'] as bool? ?? false;
           final provider = payload?['provider'] as String? ?? '';
-          _lyrics = LyricsData(content: content, synced: synced, provider: provider);
+          _lyrics =
+              LyricsData(content: content, synced: synced, provider: provider);
 
           // Não precisa mais do capture_start_time do servidor
           // Vamos inicializar timestamp local quando receber timecode_updated
