@@ -13,6 +13,9 @@ dependencies:
   # WebSocket client
   web_socket_channel: ^3.0.3
   
+  # HTTP client (tradução de letras)
+  http: ^1.2.0
+  
   # State management
   provider: ^6.1.1
   

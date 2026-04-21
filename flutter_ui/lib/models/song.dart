@@ -76,6 +76,27 @@ class LyricsData {
 
     return lines;
   }
+
+  /// Retorna true se as letras contêm script não-latino suficiente para
+  /// justificar oferecer tradução (japonês, coreano, árabe, hebraico, tailandês…).
+  ///
+  /// Limiar: >5% dos caracteres imprimíveis em scripts não-latinos.
+  bool get needsTranslation {
+    if (lines.isEmpty) return false;
+    final allText = lines.map((l) => l.text).join('');
+    final printable = allText.replaceAll(RegExp(r'\s'), '');
+    if (printable.isEmpty) return false;
+    final nonLatin = RegExp(
+      r'[\u3000-\u9FFF' // CJK / Japonês (hiragana, katakana, kanji)
+      r'\uAC00-\uD7AF' // Coreano (hangul)
+      r'\u0600-\u06FF' // Árabe
+      r'\u0590-\u05FF' // Hebraico
+      r'\u0E00-\u0E7F' // Tailandês
+      r'\u0400-\u04FF]', // Cirílico (russo, ucraniano…)
+    );
+    final count = nonLatin.allMatches(printable).length;
+    return (count / printable.length) > 0.05;
+  }
 }
 
 class LyricLine {

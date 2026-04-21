@@ -856,7 +856,8 @@ class RecognitionWorkerHeadless(threading.Thread):
             return
         
         # New song detected
-        _LOG.info(f"Nova música: {result.title} - {result.artist} (confiança={result.confidence:.1%})")
+        conf_str = f"{result.confidence:.1%}" if result.confidence is not None else "N/A"
+        _LOG.info(f"Nova música: {result.title} - {result.artist} (confiança={conf_str})")
         self._current_song_key = song_key
         self._change_baseline = None
         self._change_bad_frames = 0

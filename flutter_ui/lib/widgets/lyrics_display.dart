@@ -120,7 +120,7 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
           _lineKeys = List.generate(lyrics.lines.length, (_) => GlobalKey());
         }
 
-        return _buildLyricsList(lyrics);
+        return _buildLyricsList(lyrics, ws);
       },
     );
   }
@@ -172,10 +172,11 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
     );
   }
 
-  Widget _buildLyricsList(LyricsData lyrics) {
+  Widget _buildLyricsList(LyricsData lyrics, WebSocketService ws) {
     // SingleChildScrollView + Column garante que todos os itens estão na
     // render tree, permitindo Scrollable.ensureVisible funcionar em qualquer
     // linha — inclusive as que ainda não foram visíveis.
+    final showTranslation = ws.showTranslation && ws.translatedLines != null;
     return Container(
       margin: const EdgeInsets.fromLTRB(10, 8, 10, 10),
       decoration: BoxDecoration(
@@ -183,29 +184,115 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
         color: Colors.white.withOpacity(0.03),
         border: Border.all(color: Colors.white.withOpacity(0.08)),
       ),
-      child: SingleChildScrollView(
-        controller: _scrollController,
-        padding: const EdgeInsets.symmetric(vertical: 30, horizontal: 18),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            for (int index = 0; index < lyrics.lines.length; index++)
-              _buildLyricLine(lyrics, index),
-            if (lyrics.provider.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 20, bottom: 4),
-                child: Text(
-                  _providerLabel(lyrics.provider),
-                  style: const TextStyle(
-                    color: Colors.white24,
-                    fontSize: 10,
-                    fontStyle: FontStyle.italic,
-                    letterSpacing: 0.4,
-                  ),
-                ),
+      child: Column(
+        children: [
+          // Header com botão de tradução (exibido só quando aplicável)
+          if (ws.canTranslate || ws.translatedLines != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 10, 10, 0),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  if (ws.isTranslating)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 8),
+                      child: SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 1.5,
+                          color: Colors.white38,
+                        ),
+                      ),
+                    )
+                  else
+                    Tooltip(
+                      message: showTranslation
+                          ? 'Mostrar original'
+                          : 'Traduzir para português',
+                      child: InkWell(
+                        onTap: ws.isTranslating ? null : ws.toggleTranslation,
+                        borderRadius: BorderRadius.circular(8),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(8),
+                            color: showTranslation
+                                ? Colors.teal.withOpacity(0.18)
+                                : Colors.white.withOpacity(0.06),
+                            border: Border.all(
+                              color: showTranslation
+                                  ? Colors.teal.withOpacity(0.5)
+                                  : Colors.white.withOpacity(0.12),
+                            ),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.translate_rounded,
+                                size: 13,
+                                color: showTranslation
+                                    ? Colors.teal.shade200
+                                    : Colors.white38,
+                              ),
+                              const SizedBox(width: 4),
+                              Text(
+                                showTranslation ? 'Original' : 'Traduzir',
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  color: showTranslation
+                                      ? Colors.teal.shade200
+                                      : Colors.white38,
+                                  fontWeight: showTranslation
+                                      ? FontWeight.w600
+                                      : FontWeight.normal,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
               ),
-          ],
-        ),
+            ),
+          // Lista de letras
+          Expanded(
+            child: SingleChildScrollView(
+              controller: _scrollController,
+              padding: const EdgeInsets.symmetric(vertical: 30, horizontal: 18),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  for (int index = 0; index < lyrics.lines.length; index++)
+                    _buildLyricLine(
+                      lyrics,
+                      index,
+                      showTranslation &&
+                              index < (ws.translatedLines?.length ?? 0)
+                          ? ws.translatedLines![index]
+                          : null,
+                    ),
+                  if (lyrics.provider.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 20, bottom: 4),
+                      child: Text(
+                        _providerLabel(lyrics.provider),
+                        style: const TextStyle(
+                          color: Colors.white24,
+                          fontSize: 10,
+                          fontStyle: FontStyle.italic,
+                          letterSpacing: 0.4,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -223,8 +310,9 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
     }
   }
 
-  Widget _buildLyricLine(LyricsData lyrics, int index) {
+  Widget _buildLyricLine(LyricsData lyrics, int index, String? translatedText) {
     final line = lyrics.lines[index];
+    final displayText = translatedText ?? line.text;
     final isActive = lyrics.synced && index == _currentLineIndex;
     final isPast = lyrics.synced && index < _currentLineIndex;
     // Chave para Scrollable.ensureVisible — segura mesmo se ainda não inicializada.
@@ -255,7 +343,7 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
           height: 1.45,
         ),
         child: Text(
-          line.text,
+          displayText,
           textAlign: TextAlign.center,
         ),
       ),

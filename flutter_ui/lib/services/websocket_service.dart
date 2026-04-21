@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
+import 'package:http/http.dart' as http;
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../models/song.dart';
@@ -25,6 +26,11 @@ class WebSocketService extends ChangeNotifier {
   List<double> _audioSpectrum = List.filled(32, 0.0);
   int _lastSpectrumNotifyTime = 0;
 
+  // Tradução de letras
+  List<String>? _translatedLines;
+  bool _isTranslating = false;
+  bool _showTranslation = false;
+
   // Getters
   String get status => _status;
   Song? get currentSong => _currentSong;
@@ -36,6 +42,13 @@ class WebSocketService extends ChangeNotifier {
   bool get isDebugOnly => _isDebugOnly;
   String? get error => _error;
   List<double> get audioSpectrum => _audioSpectrum;
+
+  // Getters de tradução
+  List<String>? get translatedLines => _translatedLines;
+  bool get isTranslating => _isTranslating;
+  bool get showTranslation => _showTranslation;
+  bool get canTranslate =>
+      _lyrics != null && _lyrics!.needsTranslation && !_isTranslating;
 
   /// Calcula posição atual da música em tempo real, com offset de letra aplicado
   int get currentPositionMs {
@@ -122,15 +135,19 @@ class WebSocketService extends ChangeNotifier {
         case 'song_found':
           _currentSong = Song.fromJson(payload ?? {});
           _status = 'Tocando: $_currentSong';
-          // Resetar timecode ao trocar de música
+          // Resetar timecode e tradução ao trocar de música
           _timecodeMs = 0;
           _localTimestamp = null;
+          _translatedLines = null;
+          _showTranslation = false;
           break;
 
         case 'song_not_found':
           _status = 'Nenhuma música tocando';
           _currentSong = null;
           _lyrics = null;
+          _translatedLines = null;
+          _showTranslation = false;
           // Resetar sincronização
           _timecodeMs = 0;
           _localTimestamp = null;
@@ -270,6 +287,75 @@ class WebSocketService extends ChangeNotifier {
 
   void toggleDebugOnly() {
     setDebugOnly(!_isDebugOnly);
+  }
+
+  // ── Tradução de letras ────────────────────────────────────────────────────
+
+  /// Alterna entre original e traduzido. Se ainda não traduziu, inicia a tradução.
+  Future<void> toggleTranslation() async {
+    if (_translatedLines != null) {
+      _showTranslation = !_showTranslation;
+      notifyListeners();
+    } else {
+      await translateLyrics();
+    }
+  }
+
+  /// Traduz todas as linhas das letras via Google Translate (endpoint livre, sem chave).
+  Future<void> translateLyrics() async {
+    if (_lyrics == null || _lyrics!.lines.isEmpty || _isTranslating) return;
+
+    _isTranslating = true;
+    notifyListeners();
+
+    try {
+      final originalLines = _lyrics!.lines.map((l) => l.text).toList();
+      // Separador improvável de aparecer em letras musicais
+      const sep = '\u200B|\u200B';
+      final joined = originalLines.join(sep);
+
+      final uri = Uri.parse(
+        'https://translate.googleapis.com/translate_a/single'
+        '?client=gtx&sl=auto&tl=pt-BR&dt=t'
+        '&q=${Uri.encodeComponent(joined)}',
+      );
+
+      final response = await http.get(uri).timeout(const Duration(seconds: 15));
+
+      if (response.statusCode == 200) {
+        final raw = jsonDecode(response.body) as List<dynamic>;
+        // raw[0] = lista de [translated_chunk, original_chunk, ...]
+        final chunks = raw[0] as List<dynamic>;
+        final fullTranslation =
+            chunks.map((c) => (c as List<dynamic>)[0] as String).join('');
+        // Reconstituir linhas pelo separador (o Google pode ajustar espaços em torno dele)
+        final translatedLines = fullTranslation
+            .split(RegExp(r'\u200B\s*\|\s*\u200B'))
+            .map((l) => l.trim())
+            .toList();
+        // Garantir mesmo número de linhas que o original
+        if (translatedLines.length == originalLines.length) {
+          _translatedLines = translatedLines;
+        } else {
+          // Fallback: alinhar o que chegou, preencher restante com original
+          _translatedLines = List.generate(
+            originalLines.length,
+            (i) => i < translatedLines.length
+                ? translatedLines[i]
+                : originalLines[i],
+          );
+        }
+        _showTranslation = true;
+        debugPrint('Tradução concluída: ${_translatedLines!.length} linhas');
+      } else {
+        debugPrint('Erro na tradução: HTTP ${response.statusCode}');
+      }
+    } catch (e) {
+      debugPrint('Erro ao traduzir letras: $e');
+    } finally {
+      _isTranslating = false;
+      notifyListeners();
+    }
   }
 
   @override
