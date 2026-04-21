@@ -33,3 +33,11 @@ rich>=13.0.0
 
 # Auto-reload ao salvar arquivos (python main_server_headless.py --reload)
 watchfiles>=0.21.0
+
+# SMTC Monitor: detecta troca de faixa via Windows OS (opcional, Windows 10+ apenas)
+# Instale manualmente se quiser esse recurso:
+#   pip install winrt-runtime "winrt-Windows.Media.Control" "winrt-Windows.Foundation" "winrt-Windows.Foundation.Collections"
+# winrt-runtime>=2.0.0b2
+# winrt-Windows.Media.Control>=2.0.0b2
+# winrt-Windows.Foundation>=2.0.0b2
+# winrt-Windows.Foundation.Collections>=2.0.0b2

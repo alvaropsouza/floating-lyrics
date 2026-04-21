@@ -130,6 +130,7 @@ class WebSocketService extends ChangeNotifier {
         case 'song_not_found':
           _status = 'Nenhuma música tocando';
           _currentSong = null;
+          _lyrics = null;
           // Resetar sincronização
           _timecodeMs = 0;
           _localTimestamp = null;

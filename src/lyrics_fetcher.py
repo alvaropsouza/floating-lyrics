@@ -25,6 +25,11 @@ import requests
 _LOG = logging.getLogger(__name__)
 _CACHE_DIR = Path(__file__).resolve().parent.parent / "cache" / "lyrics"
 _ARTIST_SPLIT_RE = re.compile(r'[,&/]')  # separadores de artistas compostos
+# Remove "feat.", "ft.", "featuring" e variantes do artista (vindos de APIs de reconhecimento).
+_FEAT_RE = re.compile(
+    r'\s*[\[(]?\s*(?:feat(?:uring|\.)?|ft\.?)\s+[^\])]*[\])]?\s*$',
+    re.IGNORECASE,
+)
 # Marcadores de seção de letra: [Chorus], [Verse 1], [Bridge], etc.
 # Linha inteira entre colchetes, sem timestamp numérico (que seria [mm:ss.cc]).
 _SECTION_MARKER_RE = re.compile(r'^\[(?!\d+:)[^\]]+\]$')
@@ -35,6 +40,20 @@ def _is_lrc_section_marker(line: str) -> bool:
     """Retorna True se a linha LRC, após remover timestamps, for apenas um marcador de seção."""
     text = _LRC_TIMESTAMP_RE.sub('', line).strip()
     return bool(_SECTION_MARKER_RE.match(text))
+
+
+def _clean_artist(artist: str) -> str:
+    """Remove sufixos de artista participante (feat./ft./featuring) retornados pelas APIs.
+    
+    Ex: 'Detonautas, Alguém (feat. Outro)' → 'Detonautas'
+        'Artista ft. Convidado' → 'Artista'
+    Pega apenas o artista principal (antes da primeira vírgula/feat).
+    """
+    # Remover feat/ft do artista completo primeiro
+    cleaned = _FEAT_RE.sub('', artist).strip()
+    # Pegar só o primeiro artista antes de vírgula/& (artistas compostos)
+    primary = _ARTIST_SPLIT_RE.split(cleaned)[0].strip()
+    return primary or cleaned
 
 
 @dataclass
@@ -112,30 +131,49 @@ class LrcLibFetcher:
         """Cria e submete todas as tarefas de busca para um ThreadPoolExecutor."""
         duration = max(0, int(duration_s or 0))
         first_artist = _ARTIST_SPLIT_RE.split(artist)[0].strip()
+        clean_artist = _clean_artist(artist)   # sem feat./ft., artista principal
         plain_artist = _strip_accents(artist)
         plain_title = _strip_accents(title)
         candidates = self._duration_candidates(duration)
         base_url, timeout = self.BASE_URL, self.TIMEOUT
 
-        pool = ThreadPoolExecutor(max_workers=8)
+        pool = ThreadPoolExecutor(max_workers=10)
         tasks: list = []
 
-        # /get — artista principal, todos os candidatos de duração
+        # /get — artista principal, todos os candidatos de duração (com album)
         for d in candidates:
             tasks.append(pool.submit(
                 self._fetch_one_candidate, base_url, title, artist, album, d, timeout,
             ))
-        # /get — primeiro artista (artistas compostos "A, B, C" → "A")
-        if first_artist and first_artist.lower() != artist.lower():
+        # /get — artista principal SEM album (album de API pode ser coletânea/reedição)
+        if album:
             for d in candidates:
                 tasks.append(pool.submit(
-                    self._fetch_one_candidate, base_url, title, first_artist, album, d, timeout,
+                    self._fetch_one_candidate, base_url, title, artist, "", d, timeout,
+                ))
+        # /get — artista limpo (sem feat./ft.) se diferente
+        if clean_artist and clean_artist.lower() != artist.lower():
+            for d in candidates:
+                tasks.append(pool.submit(
+                    self._fetch_one_candidate, base_url, title, clean_artist, "", d, timeout,
+                ))
+        # /get — primeiro artista (artistas compostos "A, B, C" → "A")
+        if first_artist and first_artist.lower() != artist.lower() and first_artist.lower() != clean_artist.lower():
+            for d in candidates:
+                tasks.append(pool.submit(
+                    self._fetch_one_candidate, base_url, title, first_artist, "", d, timeout,
                 ))
         # /search — query principal: "{artista} {título}"
         tasks.append(pool.submit(
             self._search_one_isolated,
             f"{artist} {title}", title, artist, duration, base_url, timeout,
         ))
+        # /search — query com artista limpo (sem feat.)
+        if clean_artist and clean_artist.lower() != artist.lower():
+            tasks.append(pool.submit(
+                self._search_one_isolated,
+                f"{clean_artist} {title}", title, clean_artist, duration, base_url, timeout,
+            ))
         # /search — query sem acentos (diferença NFC/NFD)
         if plain_artist != artist or plain_title != title:
             tasks.append(pool.submit(
@@ -760,13 +798,15 @@ class LyricsFetcher:
             return cached_disk
 
         result: Optional[LyricsResult] = None
+        # Artista limpo (sem feat./ft.) para Musixmatch e AudCR que não fazem fallback interno
+        artist_clean = _clean_artist(artist)
         for provider in self._provider_order:
             if provider == "lrclib":
                 result = self._lrclib.fetch(title, artist, album, duration_s)
             elif provider == "musixmatch":
-                result = self._musixmatch.fetch(title, artist)
+                result = self._musixmatch.fetch(title, artist_clean)
             elif provider == "audcr":
-                result = self._audcr.fetch(title, artist)
+                result = self._audcr.fetch(title, artist_clean)
             else:
                 continue
 

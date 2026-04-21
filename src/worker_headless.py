@@ -17,6 +17,16 @@ from typing import Callable, Any
 
 from src.song_recognition import RateLimitError
 
+# SMTC Monitor (Windows - detecção de troca de faixa via OS)
+try:
+    from src.smtc_monitor import SmtcMonitor, smtc_available
+    _SMTC_IMPORTED = True
+except ImportError:
+    _SMTC_IMPORTED = False
+    SmtcMonitor = None  # type: ignore[assignment,misc]
+    def smtc_available() -> bool:  # type: ignore[misc]
+        return False
+
 # STT Sync (Fase 2) - Importação condicional
 try:
     from src.speech_recognition import SpeechRecognizer
@@ -51,6 +61,8 @@ class RecognitionWorkerHeadless(threading.Thread):
         self._stop_flag = threading.Event()
         self._pause_flag = threading.Event()
         self._debug_only_flag = threading.Event()
+        # Sinalizado por fontes externas (ex: SMTC) para acordar o loop imediatamente
+        self._wake_event = threading.Event()
         self._pause_status_emitted = False
         self._current_song_key: tuple[str, str, str] | None = None
         self._miss_streak: int = 0
@@ -179,6 +191,20 @@ class RecognitionWorkerHeadless(threading.Thread):
         self._callbacks.setdefault('stt_matched', [])
         self._callbacks.setdefault('sync_corrected', [])
 
+        # ─ SMTC Monitor (Windows track-change detection) ───────────────────
+        self._smtc_monitor: SmtcMonitor | None = None
+        self._smtc_enabled = False
+        if _SMTC_IMPORTED:
+            self._smtc_enabled = self._config.getboolean(
+                "Recognition", "smtc_enabled", fallback=True
+            )
+            if self._smtc_enabled:
+                poll_s = self._config.getfloat(
+                    "Recognition", "smtc_poll_interval_s", fallback=1.0
+                )
+                self._smtc_monitor = SmtcMonitor(poll_interval_s=poll_s)
+                self._smtc_monitor.on_track_changed(self._on_smtc_track_changed)
+
     @staticmethod
     def _sanitize_part(value: str, fallback: str) -> str:
         raw = (value or "").strip()
@@ -212,7 +238,12 @@ class RecognitionWorkerHeadless(threading.Thread):
         """Para a thread."""
         self._spectrum_running = False
         self._stop_flag.set()
+        self._wake_event.set()  # acorda _wait_interval imediatamente para responder ao stop
         self._pause_flag.clear()
+
+        # Parar SMTC monitor
+        if self._smtc_monitor is not None:
+            self._smtc_monitor.stop()
         
         # 🎤 Parar STT sync
         self._stop_stt_loop()
@@ -281,6 +312,17 @@ class RecognitionWorkerHeadless(threading.Thread):
             name="SpectrumCapture"
         )
         self._spectrum_thread.start()
+
+        # Iniciar monitor SMTC (detecção instantânea de troca de faixa via Windows OS)
+        if self._smtc_monitor is not None:
+            ok = self._smtc_monitor.start()
+            if ok:
+                _LOG.info("SmtcMonitor ativo — trocas de faixa detectadas via SMTC do Windows")
+            else:
+                _LOG.warning(
+                    "SmtcMonitor não pôde iniciar — pacote winsdk/winrt não instalado. "
+                    "Instale com: pip install winsdk"
+                )
 
         # Iniciar thread STT em background — o modelo Whisper é carregado dentro da thread
         # (nunca no event loop asyncio) e a thread fica em idle até as letras chegarem
@@ -400,6 +442,35 @@ class RecognitionWorkerHeadless(threading.Thread):
             self._current_lyrics_for_stt = None
             self._current_lyrics_index = 0
         self._emit('song_not_found')
+
+    def _on_smtc_track_changed(self, smtc_title: str, smtc_artist: str) -> None:
+        """Callback chamado pelo SmtcMonitor quando o Windows detecta troca de faixa.
+
+        Roda em thread de background do SmtcMonitor — apenas redefine o estado
+        e deixa o ciclo de reconhecimento detectar e confirmar a nova faixa.
+        """
+        if self._pause_flag.is_set() or self._stop_flag.is_set():
+            return
+
+        # Verificar se já estamos rastreando exatamente esta faixa
+        if self._current_song_key is not None:
+            cur_title, cur_artist, _ = self._current_song_key
+            if (
+                cur_title.casefold() == smtc_title.casefold()
+                and cur_artist.casefold() == smtc_artist.casefold()
+            ):
+                _LOG.debug(
+                    "SMTC: confirmação de faixa já rastreada '%s' — '%s', ignorando",
+                    smtc_title,
+                    smtc_artist,
+                )
+                return
+
+        # Nova faixa detectada pelo OS → forçar redetecção e acordar o loop imediatamente
+        self._reset_song_state(
+            f"SMTC: nova faixa detectada pelo Windows — '{smtc_title}' — '{smtc_artist}'"
+        )
+        self._wake_event.set()
 
     def _emit_compensated_timecode(self, timecode_ms: int, capture_end: float, context: str) -> None:
         """Emite timecode compensado pela latência de rede/processamento.
@@ -535,9 +606,14 @@ class RecognitionWorkerHeadless(threading.Thread):
         return audio_data, capture_start
 
     def _wait_interval(self) -> None:
-        """Sleep for 'recognition_interval' seconds, checking the stop flag."""
+        """Sleep for 'recognition_interval' seconds, checking the stop flag.
+
+        Pode ser interrompido antecipadamente via _wake_event (ex: SMTC detectou troca).
+        """
         interval = self._interval_for_cycle()
-        self._stop_flag.wait(timeout=interval)
+        # Usa dois waits encadeados: _wake_event acorda antes do timeout, _stop_flag para o loop
+        self._wake_event.wait(timeout=interval)
+        self._wake_event.clear()
 
     def _interval_for_cycle(self) -> float:
         """Return the appropriate interval based on current state."""
