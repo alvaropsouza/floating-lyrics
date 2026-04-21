@@ -29,7 +29,6 @@ class HomeScreen extends StatelessWidget {
         child: Column(
           children: [
             const _TopBar(),
-            const _StatusBar(),
             Padding(
               padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
               child: _ControlPanel(colors: colors),
@@ -106,45 +105,6 @@ class _TopBar extends StatelessWidget {
   }
 }
 
-class _StatusBar extends StatelessWidget {
-  const _StatusBar();
-
-  @override
-  Widget build(BuildContext context) {
-    return Consumer<WebSocketService>(
-      builder: (context, ws, _) {
-        final connectedColor =
-            ws.isConnected ? Colors.greenAccent : Colors.redAccent;
-        return Container(
-          width: double.infinity,
-          margin: const EdgeInsets.fromLTRB(12, 10, 12, 0),
-          padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 12),
-          decoration: BoxDecoration(
-            color: Colors.white.withOpacity(0.04),
-            borderRadius: BorderRadius.circular(12),
-            border:
-                Border.all(color: connectedColor.withOpacity(0.6), width: 1),
-          ),
-          child: Row(
-            children: [
-              Icon(Icons.circle, size: 9, color: connectedColor),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(
-                  ws.status,
-                  style: const TextStyle(
-                      fontSize: 11, fontWeight: FontWeight.w500),
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-}
-
 class _ControlPanel extends StatelessWidget {
   final ColorScheme colors;
 
@@ -156,7 +116,6 @@ class _ControlPanel extends StatelessWidget {
       builder: (context, ws, _) {
         final canControl = ws.isConnected;
         final paused = ws.isPaused;
-        final debugOnly = ws.isDebugOnly;
 
         return Row(
           children: [
@@ -173,48 +132,6 @@ class _ControlPanel extends StatelessWidget {
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(12),
                   ),
-                ),
-              ),
-            ),
-            const SizedBox(width: 8),
-            Tooltip(
-              message: debugOnly
-                  ? 'Capturando áudio sem enviar para APIs'
-                  : 'Capturar áudio sem gastar tokens',
-              child: OutlinedButton.icon(
-                onPressed: canControl ? ws.toggleDebugOnly : null,
-                icon: Icon(
-                  debugOnly ? Icons.bug_report : Icons.bug_report_outlined,
-                  size: 18,
-                ),
-                label: Text(debugOnly ? 'Debug ON' : 'Debug'),
-                style: OutlinedButton.styleFrom(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-                  foregroundColor: debugOnly ? Colors.amber : Colors.white70,
-                  side: BorderSide(
-                    color: debugOnly
-                        ? Colors.amber.withOpacity(0.6)
-                        : Colors.white.withOpacity(0.2),
-                  ),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(width: 8),
-            OutlinedButton.icon(
-              onPressed: ws.ping,
-              icon: const Icon(Icons.network_ping_rounded),
-              label: const Text('Ping'),
-              style: OutlinedButton.styleFrom(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-                foregroundColor: Colors.white70,
-                side: BorderSide(color: Colors.white.withOpacity(0.2)),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12),
                 ),
               ),
             ),

@@ -55,17 +55,36 @@ class SpeechRecognizer:
                     if not torch.cuda.is_available():
                         _LOG.warning("CUDA não disponível — usando CPU para Whisper.")
                         actual_device = "cpu"
-                except ImportError:
-                    _LOG.warning("PyTorch não instalado — usando CPU para Whisper.")
+                except (ImportError, OSError):
+                    # OSError = DLL do torch não carregou (ex: c10.dll no Windows)
+                    _LOG.warning("PyTorch não pôde ser carregado — usando CPU para Whisper.")
                     actual_device = "cpu"
 
-            self.model = WhisperModel(
-                model_size,
-                device=actual_device,
-                compute_type="int8",
-                num_workers=1,
-                cpu_threads=4,
-            )
+            try:
+                self.model = WhisperModel(
+                    model_size,
+                    device=actual_device,
+                    compute_type="int8",
+                    num_workers=1,
+                    cpu_threads=4,
+                )
+            except (RuntimeError, OSError) as dll_exc:
+                if actual_device != "cpu":
+                    _LOG.warning(
+                        "Whisper falhou com device='%s' (%s) — tentando CPU.",
+                        actual_device,
+                        dll_exc,
+                    )
+                    actual_device = "cpu"
+                    self.model = WhisperModel(
+                        model_size,
+                        device="cpu",
+                        compute_type="int8",
+                        num_workers=1,
+                        cpu_threads=4,
+                    )
+                else:
+                    raise
             self.sample_rate = 16000  # Whisper requer 16 kHz
             self.device = actual_device
 

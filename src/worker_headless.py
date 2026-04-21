@@ -32,7 +32,8 @@ try:
     from src.speech_recognition import SpeechRecognizer
     from src.lyrics_matcher import LyricsMatcher
     _STT_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
+    # OSError cobre falhas de DLL do Windows (ex: c10.dll do PyTorch não carrega)
     _STT_AVAILABLE = False
     SpeechRecognizer = None
     LyricsMatcher = None
@@ -1028,7 +1029,21 @@ class RecognitionWorkerHeadless(threading.Thread):
             
             _LOG.info("🎤 STT Sync: Inicializado com sucesso")
         except Exception as e:
-            _LOG.error(f"❌ Erro ao inicializar STT: {e}", exc_info=True)
+            # Para erros de DLL (OSError no Windows) o traceback é longo mas sem
+            # informação acionável — logar apenas a mensagem e desativar STT.
+            is_dll_error = isinstance(e, OSError) and "WinError" in str(e)
+            _LOG.error(
+                "❌ Erro ao inicializar STT (%s): %s%s",
+                type(e).__name__,
+                e,
+                "" if is_dll_error else " — verifique instalação do faster-whisper/torch",
+                exc_info=not is_dll_error,
+            )
+            if is_dll_error:
+                _LOG.warning(
+                    "Dica: o PyTorch instalado parece incompatível com este ambiente. "
+                    "Tente: pip install torch --index-url https://download.pytorch.org/whl/cpu"
+                )
             self._stt_enabled = False
 
     def _update_stt_lyrics(self, lyrics_text: str) -> None:
