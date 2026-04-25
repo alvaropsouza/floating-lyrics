@@ -341,8 +341,9 @@ def main() -> int:
 
 
 def _run_with_reload() -> int:
-    """Reinicia o servidor automaticamente ao detectar mudanças em .py."""
+    """Reinicia o servidor automaticamente ao detectar mudanças em .py ou quando crashar."""
     import subprocess
+    import threading
     from watchfiles import watch
 
     src_dir = Path(__file__).parent
@@ -353,24 +354,66 @@ def _run_with_reload() -> int:
 
     args = [sys.executable, str(Path(__file__).resolve())]
 
+    # Evento sinalizado tanto por mudança de arquivo quanto por crash do subprocesso
+    _restart_event = threading.Event()
+
+    def _watch_thread() -> None:
+        """Thread que monitora mudanças de arquivo e sinaliza reinício."""
+        try:
+            for _ in watch(*watch_paths, yield_on_timeout=False):
+                _LOG.info("[yellow]🔄 Mudança detectada — reiniciando servidor...[/yellow]")
+                _restart_event.set()
+        except Exception:
+            pass
+
+    def _proc_monitor_thread(proc: subprocess.Popen) -> None:
+        """Thread que monitora o subprocesso e sinaliza reinício se ele morrer."""
+        proc.wait()
+        if not _stop_flag.is_set():
+            code = proc.returncode
+            _LOG.warning(
+                "Servidor subprocesso encerrou inesperadamente com código %d — reiniciando em 2s...",
+                code,
+            )
+            time.sleep(2)
+            _restart_event.set()
+
+    _stop_flag = threading.Event()
+
+    watcher_thread = threading.Thread(target=_watch_thread, daemon=True)
+    watcher_thread.start()
+
     proc = subprocess.Popen(args)
+    monitor_thread = threading.Thread(target=_proc_monitor_thread, args=(proc,), daemon=True)
+    monitor_thread.start()
+
     try:
-        for _ in watch(*watch_paths, yield_on_timeout=False):
-            _LOG.info("[yellow]🔄 Mudança detectada — reiniciando servidor...[/yellow]")
+        while True:
+            _restart_event.wait()
+            _restart_event.clear()
+
+            if proc.poll() is None:
+                # Processo ainda rodando: matar para reiniciar
+                proc.terminate()
+                try:
+                    proc.wait(timeout=4)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+
+            proc = subprocess.Popen(args)
+            monitor_thread = threading.Thread(target=_proc_monitor_thread, args=(proc,), daemon=True)
+            monitor_thread.start()
+
+    except KeyboardInterrupt:
+        _LOG.info("\n[red]Parando watcher...[/red]")
+        _stop_flag.set()
+        if proc.poll() is None:
             proc.terminate()
             try:
                 proc.wait(timeout=4)
             except subprocess.TimeoutExpired:
                 proc.kill()
-                proc.wait()
-            proc = subprocess.Popen(args)
-    except KeyboardInterrupt:
-        _LOG.info("\n[red]Parando watcher...[/red]")
-        proc.terminate()
-        try:
-            proc.wait(timeout=4)
-        except subprocess.TimeoutExpired:
-            proc.kill()
     return 0
 
 

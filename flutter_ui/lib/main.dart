@@ -5,6 +5,7 @@ import 'package:window_manager/window_manager.dart';
 
 import 'services/websocket_service.dart';
 import 'screens/home_screen.dart';
+import 'theme/app_theme.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -56,15 +57,7 @@ class FloatingLyricsApp extends StatelessWidget {
       child: MaterialApp(
         title: 'Floating Lyrics',
         debugShowCheckedModeBanner: false,
-        theme: ThemeData(
-          useMaterial3: true,
-          brightness: Brightness.dark,
-          colorScheme: ColorScheme.fromSeed(
-            seedColor: const Color(0xFF0EA5A4),
-            brightness: Brightness.dark,
-          ),
-          scaffoldBackgroundColor: const Color(0xFF0A0F17),
-        ),
+        theme: buildAppTheme(),
         home: const HomeScreen(),
       ),
     );

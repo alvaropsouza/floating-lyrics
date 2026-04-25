@@ -73,11 +73,11 @@ class _AudioVisualizerState extends State<AudioVisualizer>
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
           colors: [
-            Colors.black.withOpacity(0.8),
-            Colors.black.withOpacity(0.4),
+            Colors.black.withValues(alpha: 0.8),
+            Colors.black.withValues(alpha: 0.4),
           ],
         ),
-        border: Border.all(color: widget.barColor.withOpacity(0.3)),
+        border: Border.all(color: widget.barColor.withValues(alpha: 0.3)),
         borderRadius: BorderRadius.circular(8),
       ),
       child: Padding(
@@ -116,7 +116,7 @@ class _BarsPainter extends CustomPainter {
 
     final paintBar = Paint()..style = PaintingStyle.fill;
     final paintGlow = Paint()
-      ..color = color.withOpacity(0.35)
+      ..color = color.withValues(alpha: 0.35)
       ..style = PaintingStyle.fill
       ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3);
 
@@ -132,7 +132,7 @@ class _BarsPainter extends CustomPainter {
       paintBar.shader = LinearGradient(
         begin: Alignment.bottomCenter,
         end: Alignment.topCenter,
-        colors: [color, color.withOpacity(0.5)],
+        colors: [color, color.withValues(alpha: 0.5)],
       ).createShader(Rect.fromLTWH(x, maxHeight - h, barWidth, h));
 
       canvas.drawRRect(rect, paintGlow);
@@ -214,9 +214,9 @@ class _WaveVisualizerState extends State<WaveVisualizer>
     return Container(
       height: 80,
       decoration: BoxDecoration(
-        color: Colors.black.withOpacity(0.8),
+        color: Colors.black.withValues(alpha: 0.8),
         border: Border.all(
-          color: widget.waveColor.withOpacity(0.3),
+          color: widget.waveColor.withValues(alpha: 0.3),
           width: 1,
         ),
         borderRadius: BorderRadius.circular(8),
@@ -264,7 +264,7 @@ class _WavePainter extends CustomPainter {
 
     // Glow effect
     final glowPaint = Paint()
-      ..color = color.withOpacity(0.3)
+      ..color = color.withValues(alpha: 0.3)
       ..strokeWidth = 6
       ..style = PaintingStyle.stroke
       ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 3);

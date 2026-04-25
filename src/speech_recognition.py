@@ -6,12 +6,15 @@ Usa faster-whisper para reconhecimento offline de voz cantada.
 
 from __future__ import annotations
 
+import builtins
 import io
 import logging
 import re
+import sys
 import wave
 import numpy as np
 from dataclasses import dataclass
+from contextlib import contextmanager
 from typing import Optional
 
 _LOG = logging.getLogger(__name__)
@@ -21,6 +24,75 @@ _MIN_CONFIDENCE = -0.8
 
 # Probabilidade máxima de "não há voz" — chunks mais instrumentais que vocais são descartados
 _MAX_NO_SPEECH_PROB = 0.5
+
+
+def _clear_imported_modules(*prefixes: str) -> None:
+    """Remove módulos parcialmente carregados antes de tentar novo import."""
+    for module_name in tuple(sys.modules):
+        if any(
+            module_name == prefix or module_name.startswith(f"{prefix}.")
+            for prefix in prefixes
+        ):
+            sys.modules.pop(module_name, None)
+
+
+@contextmanager
+def _mask_torch_import_error():
+    """Faz imports de `torch` falharem com ImportError para habilitar fallback do CTranslate2."""
+    original_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "torch" or name.startswith("torch."):
+            raise ImportError("PyTorch desativado neste ambiente")
+        return original_import(name, globals, locals, fromlist, level)
+
+    builtins.__import__ = guarded_import
+    try:
+        yield
+    finally:
+        builtins.__import__ = original_import
+
+
+def _is_torch_dll_error(exc: BaseException) -> bool:
+    """Identifica falhas típicas de DLL do PyTorch no Windows."""
+    message = str(exc).lower()
+    return "torch" in message and ("c10.dll" in message or "winerror 1114" in message)
+
+
+def _import_whisper_model(allow_torch_mask: bool):
+    """Importa WhisperModel com fallback para ambientes onde o torch está quebrado."""
+    try:
+        from faster_whisper import WhisperModel
+        return WhisperModel
+    except OSError as exc:
+        if not allow_torch_mask or not _is_torch_dll_error(exc):
+            raise
+
+        _LOG.info(
+            "PyTorch (GPU) não disponível neste ambiente — iniciando Whisper em modo CPU.",
+        )
+        _LOG.debug("Detalhe da falha de DLL do PyTorch: %s", exc)
+        _clear_imported_modules("torch", "ctranslate2", "faster_whisper")
+        with _mask_torch_import_error():
+            from faster_whisper import WhisperModel
+            return WhisperModel
+
+
+def _probe_torch_cuda() -> tuple[bool, bool]:
+    """Retorna (torch_ok, cuda_disponivel) sem propagar erros de DLL."""
+    try:
+        import torch
+    except ImportError:
+        return False, False
+    except OSError:
+        _clear_imported_modules("torch")
+        return False, False
+
+    try:
+        return True, bool(torch.cuda.is_available())
+    except OSError:
+        _clear_imported_modules("torch")
+        return False, False
 
 
 @dataclass
@@ -44,24 +116,24 @@ class SpeechRecognizer:
 
     def __init__(self, model_size: str = "tiny", device: str = "cuda"):
         try:
-            from faster_whisper import WhisperModel
-
             _LOG.info("🎤 Carregando Whisper model=%s, device=%s", model_size, device)
 
             actual_device = device
+            torch_ok, cuda_available = _probe_torch_cuda()
+            allow_torch_mask = not torch_ok
+
             if device == "cuda":
-                try:
-                    import torch
-                    if not torch.cuda.is_available():
-                        _LOG.warning("CUDA não disponível — usando CPU para Whisper.")
-                        actual_device = "cpu"
-                except (ImportError, OSError):
-                    # OSError = DLL do torch não carregou (ex: c10.dll no Windows)
+                if not torch_ok:
                     _LOG.warning("PyTorch não pôde ser carregado — usando CPU para Whisper.")
                     actual_device = "cpu"
+                elif not cuda_available:
+                    _LOG.warning("CUDA não disponível — usando CPU para Whisper.")
+                    actual_device = "cpu"
+
+            whisper_model_cls = _import_whisper_model(allow_torch_mask=allow_torch_mask)
 
             try:
-                self.model = WhisperModel(
+                self.model = whisper_model_cls(
                     model_size,
                     device=actual_device,
                     compute_type="int8",
@@ -76,7 +148,7 @@ class SpeechRecognizer:
                         dll_exc,
                     )
                     actual_device = "cpu"
-                    self.model = WhisperModel(
+                    self.model = whisper_model_cls(
                         model_size,
                         device="cpu",
                         compute_type="int8",

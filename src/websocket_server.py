@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time as _time
 from typing import Any, Awaitable, Callable, Set
 
 from aiohttp import web
@@ -31,7 +32,13 @@ class WebSocketServer:
         self._clients: Set[web.WebSocketResponse] = set()
         self._runner: web.AppRunner | None = None
         self._command_handler: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]] | dict[str, Any] | None] | None = None
-        
+
+        # Estado atual para replay a clientes que conectam após eventos já emitidos
+        self._state_song: dict | None = None          # último song_found
+        self._state_lyrics: dict | None = None        # último lyrics_ready
+        self._state_timecode_ms: int | None = None    # último timecode_ms recebido
+        self._state_timecode_wall: float = 0.0        # time.time() quando foi armazenado
+
         # Registrar rotas
         self._app.router.add_get('/ws', self._websocket_handler)
         self._app.router.add_get('/health', self._health_check)
@@ -76,7 +83,19 @@ class WebSocketServer:
             "type": "connected",
             "data": {"message": "Conectado ao Floating Lyrics"}
         })
-        
+
+        # Reenviar estado atual para clientes que conectaram após os eventos já terem sido emitidos
+        if self._state_song is not None:
+            await self._send_to_client(ws, {"type": "song_found", "data": self._state_song})
+        if self._state_lyrics is not None:
+            await self._send_to_client(ws, {"type": "lyrics_ready", "data": self._state_lyrics})
+        if self._state_timecode_ms is not None:
+            elapsed_ms = int((_time.time() - self._state_timecode_wall) * 1000)
+            await self._send_to_client(ws, {
+                "type": "timecode_updated",
+                "data": {"timecode_ms": self._state_timecode_ms + elapsed_ms, "offset_ms": 0},
+            })
+
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT:
@@ -190,17 +209,19 @@ class WebSocketServer:
 
     async def emit_song_found(self, title: str, artist: str, album: str) -> None:
         """Emite evento de música encontrada."""
+        self._state_song = {"title": title, "artist": artist, "album": album}
+        self._state_lyrics = None
+        self._state_timecode_ms = None
         await self.broadcast({
             "type": "song_found",
-            "data": {
-                "title": title,
-                "artist": artist,
-                "album": album
-            }
+            "data": self._state_song,
         })
 
     async def emit_song_not_found(self) -> None:
         """Emite evento de música não encontrada."""
+        self._state_song = None
+        self._state_lyrics = None
+        self._state_timecode_ms = None
         await self.broadcast({
             "type": "song_not_found",
             "data": {}
@@ -211,12 +232,12 @@ class WebSocketServer:
         data = {
             "lyrics": lyrics,
             "synced": synced,
-            "offset_ms": offset_ms,  # Offset de sincronização (pode ser negativo)
+            "offset_ms": offset_ms,
             "provider": provider,
         }
         if capture_start_time is not None:
             data["capture_start_time"] = capture_start_time
-        
+        self._state_lyrics = data
         await self.broadcast({
             "type": "lyrics_ready",
             "data": data
@@ -224,6 +245,7 @@ class WebSocketServer:
 
     async def emit_lyrics_not_found(self) -> None:
         """Emite evento de letras não encontradas."""
+        self._state_lyrics = None
         await self.broadcast({
             "type": "lyrics_not_found",
             "data": {}
@@ -231,13 +253,14 @@ class WebSocketServer:
 
     async def emit_timecode_update(self, timecode_ms: int, capture_start_time: float | None = None, offset_ms: int = 0) -> None:
         """Emite atualização de timecode para sincronização."""
+        self._state_timecode_ms = timecode_ms
+        self._state_timecode_wall = _time.time()
         data = {
             "timecode_ms": timecode_ms,
-            "offset_ms": offset_ms  # Offset de sincronização
+            "offset_ms": offset_ms,
         }
         if capture_start_time is not None:
             data["capture_start_time"] = capture_start_time
-        
         await self.broadcast({
             "type": "timecode_updated",
             "data": data

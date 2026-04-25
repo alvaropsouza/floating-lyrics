@@ -4,6 +4,8 @@ import 'package:provider/provider.dart';
 
 import '../services/websocket_service.dart';
 import '../models/song.dart';
+import '../theme/app_tokens.dart';
+import 'translation_toggle.dart';
 
 class LyricsDisplay extends StatefulWidget {
   const LyricsDisplay({super.key});
@@ -145,9 +147,9 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
         margin: const EdgeInsets.symmetric(horizontal: 20),
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
         decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.04),
+          color: Colors.white.withValues(alpha: 0.04),
           borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: Colors.white.withOpacity(0.12)),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
         ),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -180,81 +182,24 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
     return Container(
       margin: const EdgeInsets.fromLTRB(10, 8, 10, 10),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(20),
-        color: Colors.white.withOpacity(0.03),
-        border: Border.all(color: Colors.white.withOpacity(0.08)),
+        borderRadius: BorderRadius.circular(AppRadii.shell),
+        color: Colors.white.withValues(alpha: 0.03),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
       ),
       child: Column(
         children: [
-          // Header com botão de tradução (exibido só quando aplicável)
+          // Header com toggle de tradução (exibido só quando aplicável)
           if (ws.canTranslate || ws.translatedLines != null)
             Padding(
-              padding: const EdgeInsets.fromLTRB(16, 10, 10, 0),
+              padding: const EdgeInsets.fromLTRB(14, 10, 10, 0),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.end,
                 children: [
-                  if (ws.isTranslating)
-                    const Padding(
-                      padding: EdgeInsets.symmetric(horizontal: 8),
-                      child: SizedBox(
-                        width: 14,
-                        height: 14,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 1.5,
-                          color: Colors.white38,
-                        ),
-                      ),
-                    )
-                  else
-                    Tooltip(
-                      message: showTranslation
-                          ? 'Mostrar original'
-                          : 'Traduzir para português',
-                      child: InkWell(
-                        onTap: ws.isTranslating ? null : ws.toggleTranslation,
-                        borderRadius: BorderRadius.circular(8),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 8, vertical: 4),
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(8),
-                            color: showTranslation
-                                ? Colors.teal.withOpacity(0.18)
-                                : Colors.white.withOpacity(0.06),
-                            border: Border.all(
-                              color: showTranslation
-                                  ? Colors.teal.withOpacity(0.5)
-                                  : Colors.white.withOpacity(0.12),
-                            ),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Icon(
-                                Icons.translate_rounded,
-                                size: 13,
-                                color: showTranslation
-                                    ? Colors.teal.shade200
-                                    : Colors.white38,
-                              ),
-                              const SizedBox(width: 4),
-                              Text(
-                                showTranslation ? 'Original' : 'Traduzir',
-                                style: TextStyle(
-                                  fontSize: 10,
-                                  color: showTranslation
-                                      ? Colors.teal.shade200
-                                      : Colors.white38,
-                                  fontWeight: showTranslation
-                                      ? FontWeight.w600
-                                      : FontWeight.normal,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
+                  TranslationToggle(
+                    value: showTranslation,
+                    isLoading: ws.isTranslating,
+                    onChanged: (_) => ws.toggleTranslation(),
+                  ),
                 ],
               ),
             ),
@@ -328,7 +273,9 @@ class _LyricsDisplayState extends State<LyricsDisplay> {
       ),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(12),
-        color: isActive ? Colors.white.withOpacity(0.09) : Colors.transparent,
+        color: isActive
+            ? Colors.white.withValues(alpha: 0.09)
+            : Colors.transparent,
       ),
       child: AnimatedDefaultTextStyle(
         duration: const Duration(milliseconds: 80),

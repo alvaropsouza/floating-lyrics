@@ -263,6 +263,13 @@ python scripts/test_stt_manual.py
 # Latência será ~1-2s em vez de 400-700ms
 ```
 
+### Erro: "WinError 1114" ao carregar c10.dll
+```bash
+# O backend agora tenta ignorar um torch quebrado e subir o Whisper em CPU.
+# Se ainda falhar, reinstale a variante CPU do PyTorch no venv do projeto:
+pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cpu
+```
+
 ### Erro: "Modelo não baixado"
 ```bash
 # Será baixado automaticamente na primeira execução
